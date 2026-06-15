@@ -1,0 +1,21 @@
+# SearXNG configuration for the Unified Search API.
+# Inherits SearXNG's shipped defaults and only overrides what we need.
+use_default_settings: true
+
+server:
+  # Provided via the SEARXNG_SECRET environment variable in docker-compose.
+  secret_key: "change-me-please"
+  limiter: false # internal-only instance; the API is the sole client
+  image_proxy: false
+
+search:
+  # Enable JSON so the API can consume structured results.
+  formats:
+    - html
+    - json
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+
+ui:
+  static_use_hash: true

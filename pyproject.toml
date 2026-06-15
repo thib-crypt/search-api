@@ -1,0 +1,59 @@
+[project]
+name = "unified-search-api"
+version = "0.1.0"
+description = "Self-hosted unified API for web search (SearXNG), crawling (crawl4ai) and LLM deep-research reports."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Unified Search API contributors" }]
+keywords = ["search", "crawler", "deep-research", "searxng", "crawl4ai", "llm", "fastapi"]
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.27",
+    "crawl4ai>=0.5",
+    "litellm>=1.55",
+    "instructor>=1.7",
+    "tiktoken>=0.8",
+    "python-multipart>=0.0.12",
+    "sse-starlette>=2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/unified-search-api"
+Repository = "https://github.com/your-org/unified-search-api"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# Depends()/Header() in argument defaults is the intended FastAPI idiom.
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests that hit real network / browser (deselect with -m 'not integration')",
+]

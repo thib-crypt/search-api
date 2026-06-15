@@ -2,7 +2,7 @@
 # which saves a lengthy browser install step.
 FROM unclecode/crawl4ai:latest
 
-WORKDIR /app
+WORKDIR /srv/api
 
 # uv for fast, reproducible installs.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv

@@ -2,17 +2,23 @@
 # which saves a lengthy browser install step.
 FROM unclecode/crawl4ai:latest
 
+# crawl4ai's base image runs as a non-root user. Switch to root so we can
+# install system-wide; the COPY --chmod below also normalizes file modes,
+# which matters when the build context carries restrictive permissions
+# (e.g. files checked out on a NAS with a tight umask).
+USER root
+
 WORKDIR /srv/api
 
 # uv for fast, reproducible installs.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 # Install dependencies first for better layer caching.
-COPY pyproject.toml README.md ./
+COPY --chmod=644 pyproject.toml README.md ./
 RUN uv pip install --system --no-cache .
 
 # App source.
-COPY app ./app
+COPY --chmod=755 app ./app
 
 EXPOSE 8000
 

@@ -9,6 +9,7 @@ be swapped for Redis later without touching the routes.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -63,10 +64,14 @@ class Job:
 
 
 class JobManager:
-    def __init__(self) -> None:
+    def __init__(self, *, retention_seconds: float = 3600.0) -> None:
         self._jobs: dict[str, Job] = {}
         self._subscribers: dict[str, set[asyncio.Queue]] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        # Without eviction, finished jobs (and their results) would pin memory for
+        # the process lifetime. Terminal jobs are dropped once they age past this.
+        self._retention = retention_seconds
+        self._finished_at: dict[str, float] = {}
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
@@ -80,10 +85,33 @@ class JobManager:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     def create(self, job_type: str) -> Job:
+        self._evict()
         job = Job(id=uuid4().hex, type=job_type)
         self._jobs[job.id] = job
         self._subscribers[job.id] = set()
         return job
+
+    def _evict(self) -> None:
+        """Drop terminal jobs that have aged past the retention window."""
+        if not self._finished_at:
+            return
+        cutoff = time.monotonic() - self._retention
+        stale = [jid for jid, ts in self._finished_at.items() if ts <= cutoff]
+        for jid in stale:
+            self._jobs.pop(jid, None)
+            self._subscribers.pop(jid, None)
+            self._tasks.pop(jid, None)
+            self._finished_at.pop(jid, None)
+
+    def cancel(self, job_id: str) -> bool:
+        """Cancel an in-flight job. Returns False if the job is unknown or already terminal."""
+        job = self._jobs.get(job_id)
+        if job is None or job.terminal:
+            return False
+        task = self._tasks.get(job_id)
+        if task and not task.done():
+            task.cancel()
+        return True
 
     def submit(self, job: Job, task: JobTask) -> None:
         self._tasks[job.id] = asyncio.create_task(self._run(job, task))
@@ -109,6 +137,7 @@ class JobManager:
             job.error = str(exc)
             await self._publish(job, {"event": "failed", "error": str(exc)})
         finally:
+            self._finished_at[job.id] = time.monotonic()
             self._fanout(job.id, _SENTINEL)
 
     async def _publish(self, job: Job, event: dict[str, Any]) -> None:

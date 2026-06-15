@@ -7,6 +7,8 @@ full deep-research engine.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+
 from app.core.crawl.crawler import CrawlerService
 from app.core.llm.client import LLMClient
 from app.core.llm.tokens import trim_to_tokens
@@ -92,3 +94,62 @@ class AnswerService:
             model=req.model or self._llm.default_model,
             sources=sources,
         )
+
+    async def stream_answer(self, req: AnswerRequest) -> AsyncIterator[dict]:
+        """Yield SSE-friendly dicts: searching → crawling → token… → done."""
+        import json
+
+        yield {"event": "searching", "data": json.dumps({"query": req.query})}
+
+        search = await self._searxng.search(
+            SearchRequest(
+                q=req.query,
+                language=req.language,
+                categories=req.categories,
+                max_results=req.max_sources,
+            )
+        )
+        top = search.results[: req.max_sources]
+        sources: list[Source] = [
+            Source(index=i + 1, title=r.title, url=r.url, snippet=r.snippet)
+            for i, r in enumerate(top)
+        ]
+
+        full_text: dict[str, str] = {}
+        if req.fetch_full and top:
+            yield {"event": "crawling", "data": json.dumps({"count": len(top)})}
+            pages = await self._crawler.crawl(
+                CrawlRequest(urls=[s.url for s in sources], content_filter="pruning")
+            )
+            full_text = {
+                _norm_url(p.url): p.markdown for p in pages if p.success and p.markdown
+            }
+
+        per_source_budget = max(_CONTEXT_TOKEN_BUDGET // max(len(sources), 1), 200)
+        blocks: list[str] = []
+        for s in sources:
+            body = full_text.get(_norm_url(s.url), "")
+            if body:
+                s.used_full_text = True
+            else:
+                body = s.snippet
+            body = trim_to_tokens(body, per_source_budget)
+            blocks.append(f"[{s.index}] {s.title}\nURL: {s.url}\n{body}")
+
+        context = "\n\n---\n\n".join(blocks) if blocks else "(no sources found)"
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": f"Question: {req.query}\n\nSources:\n\n{context}"},
+        ]
+
+        yield {"event": "generating", "data": json.dumps({})}
+        async for token in self._llm.stream_complete(messages, model=req.model):
+            yield {"event": "token", "data": json.dumps({"token": token})}
+
+        yield {
+            "event": "done",
+            "data": json.dumps({
+                "model": req.model or self._llm.default_model,
+                "sources": [s.model_dump() for s in sources],
+            }),
+        }

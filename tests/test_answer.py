@@ -42,6 +42,11 @@ class FakeLLM:
         self.last_messages = messages
         return "Synthesized answer citing [1] and [2]."
 
+    async def stream_complete(self, messages, *, model=None, **kwargs):
+        self.last_messages = messages
+        for token in ["Streamed ", "answer."]:
+            yield token
+
 
 def _override(searxng, crawler, llm):
     app.dependency_overrides[get_searxng] = lambda: searxng
@@ -65,6 +70,19 @@ def test_answer_endpoint_full_pipeline() -> None:
         assert crawler.called is True
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+async def test_stream_answer_yields_searching_tokens_done() -> None:
+    service = AnswerService(searxng=FakeSearxng(), crawler=FakeCrawler(), llm=FakeLLM())
+    events = []
+    async for ev in service.stream_answer(AnswerRequest(query="q", stream=True)):
+        events.append(ev)
+
+    event_types = [e["event"] for e in events]
+    assert event_types[0] == "searching"
+    assert "token" in event_types
+    assert event_types[-1] == "done"
 
 
 @pytest.mark.asyncio

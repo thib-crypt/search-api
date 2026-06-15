@@ -17,6 +17,10 @@ class AnswerRequest(BaseModel):
         default=True,
         description="Crawl full page content. If false, answer from search snippets only.",
     )
+    stream: bool = Field(
+        default=False,
+        description="Stream the answer as Server-Sent Events instead of blocking.",
+    )
 
 
 class Source(BaseModel):

@@ -8,6 +8,8 @@ long background run. The recursive engine lives in `app.core.research.engine`.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import get_crawler, get_jobs, get_llm, get_searxng, require_api_key
@@ -109,9 +111,19 @@ async def research(
         )
 
     try:
-        result = await engine.run(
-            effective_query, breadth=breadth, depth=depth, model=req.model
-        )
+        coro = engine.run(effective_query, breadth=breadth, depth=depth, model=req.model)
+        if settings.research_sync_timeout > 0:
+            result = await asyncio.wait_for(coro, timeout=settings.research_sync_timeout)
+        else:
+            result = await coro
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Research timed out after {settings.research_sync_timeout:.0f}s. "
+                "Use background=true for long queries."
+            ),
+        ) from None
     except SearxngError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:

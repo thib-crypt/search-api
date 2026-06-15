@@ -9,6 +9,7 @@ Pydantic model.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import TypeVar
 
 import instructor
@@ -49,6 +50,26 @@ class LLMClient:
             max_tokens=max_tokens or self.max_tokens,
         )
         return (resp.choices[0].message.content or "").strip()
+
+    async def stream_complete(
+        self,
+        messages: list[Message],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncIterator[str]:
+        resp = await acompletion(
+            model=model or self.default_model,
+            messages=messages,
+            temperature=self.temperature if temperature is None else temperature,
+            max_tokens=max_tokens or self.max_tokens,
+            stream=True,
+        )
+        async for chunk in resp:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
 
     async def structured(
         self,

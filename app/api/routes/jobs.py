@@ -22,6 +22,15 @@ async def get_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> JobView:
     return JobView(**job.public())
 
 
+@router.delete("/{job_id}", status_code=202, summary="Cancel a running job")
+async def cancel_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> dict:
+    if jobs.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found.")
+    if not jobs.cancel(job_id):
+        raise HTTPException(status_code=409, detail="Job is already in a terminal state.")
+    return {"job_id": job_id, "status": "cancelling"}
+
+
 @router.get("/{job_id}/stream", summary="Stream job progress as Server-Sent Events")
 async def stream_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> EventSourceResponse:
     if jobs.get(job_id) is None:

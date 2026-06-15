@@ -28,7 +28,11 @@ logging.basicConfig(level=settings.log_level)
 async def lifespan(app: FastAPI):
     # Shared async clients live on app.state for the process lifetime.
     app.state.searxng = SearxngClient(
-        base_url=settings.searxng_url, timeout=settings.searxng_timeout
+        base_url=settings.searxng_url,
+        timeout=settings.searxng_timeout,
+        cache_ttl=settings.search_cache_ttl if settings.search_cache_enabled else 0.0,
+        cache_max_size=settings.search_cache_max_size,
+        max_connections=settings.searxng_max_connections,
     )
     # The browser pool starts lazily on the first crawl, so creating the service
     # here is cheap and keeps startup fast.
@@ -40,7 +44,7 @@ async def lifespan(app: FastAPI):
         temperature=settings.llm_temperature,
         max_tokens=settings.llm_max_tokens,
     )
-    app.state.jobs = JobManager()
+    app.state.jobs = JobManager(retention_seconds=settings.job_retention_seconds)
     try:
         yield
     finally:

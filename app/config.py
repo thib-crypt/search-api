@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     # --- Hardening ---
     rate_limit_enabled: bool = Field(default=False)
     rate_limit_rpm: int = Field(default=120, description="Max requests per minute per client IP.")
+    # Set to true only when behind a trusted reverse-proxy that sets X-Forwarded-For;
+    # otherwise an attacker can spoof the header to bypass the rate limiter.
+    trusted_proxy: bool = Field(default=False)
     security_headers: bool = Field(default=True)
     cors_origins: str = Field(default="*", description="Comma-separated allowed CORS origins.")
 
@@ -40,6 +43,23 @@ class Settings(BaseSettings):
     # Internal docker DNS name by default; override to http://localhost:8080 for local runs.
     searxng_url: str = Field(default="http://searxng:8080")
     searxng_timeout: float = Field(default=15.0)
+    searxng_max_connections: int = Field(
+        default=64, description="Max pooled HTTP connections to SearXNG."
+    )
+
+    # --- Search cache (memoizes identical queries to cut redundant round-trips) ---
+    search_cache_enabled: bool = Field(default=True)
+    search_cache_ttl: float = Field(
+        default=300.0, description="Seconds an identical search result is reused."
+    )
+    search_cache_max_size: int = Field(
+        default=512, description="Max distinct queries kept (LRU eviction)."
+    )
+
+    # --- Jobs ---
+    job_retention_seconds: float = Field(
+        default=3600.0, description="Seconds a finished job is kept before eviction."
+    )
 
     # --- LLM (litellm provider strings, e.g. "openai/gpt-4o-mini", "anthropic/claude-...") ---
     llm_model: str = Field(default="openai/gpt-4o-mini")
@@ -58,6 +78,9 @@ class Settings(BaseSettings):
     research_default_breadth: int = Field(default=4)
     research_default_depth: int = Field(default=2)
     research_concurrency: int = Field(default=2)
+    # Max wall-clock seconds for a synchronous /v1/research call. 0 = no limit.
+    # Long runs should use background=true instead.
+    research_sync_timeout: float = Field(default=600.0)
 
     @property
     def api_key_set(self) -> set[str]:

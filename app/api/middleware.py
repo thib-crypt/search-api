@@ -55,7 +55,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not settings.rate_limit_enabled or request.url.path in _EXEMPT_PATHS:
             return await call_next(request)
 
-        client_ip = request.client.host if request.client else "unknown"
+        if settings.trusted_proxy:
+            forwarded_for = request.headers.get("x-forwarded-for")
+            client_ip = (
+                forwarded_for.split(",")[0].strip()
+                if forwarded_for
+                else (request.client.host if request.client else "unknown")
+            )
+        else:
+            client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
         hits = _HITS[client_ip]
         while hits and now - hits[0] > _WINDOW:

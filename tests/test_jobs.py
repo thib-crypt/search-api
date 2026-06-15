@@ -44,6 +44,23 @@ async def test_job_records_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finished_jobs_are_evicted_after_retention() -> None:
+    mgr = JobManager(retention_seconds=0.0)  # evict as soon as a job is terminal
+
+    async def task(emit) -> dict:
+        return {}
+
+    first = mgr.create("demo")
+    mgr.submit(first, task)
+    await mgr._tasks[first.id]
+    assert first.status is JobStatus.completed
+
+    # Creating another job triggers eviction of the now-stale finished one.
+    mgr.create("demo")
+    assert mgr.get(first.id) is None
+
+
+@pytest.mark.asyncio
 async def test_stream_replays_progress_after_completion() -> None:
     mgr = JobManager()
     job = mgr.create("demo")
@@ -113,3 +130,46 @@ def test_get_unknown_job_404() -> None:
     with TestClient(app) as client:
         resp = client.get("/v1/jobs/does-not-exist")
     assert resp.status_code == 404
+
+
+def test_cancel_unknown_job_404() -> None:
+    with TestClient(app) as client:
+        resp = client.delete("/v1/jobs/does-not-exist")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_running_job_returns_202() -> None:
+    import asyncio
+
+    mgr = JobManager()
+    started = asyncio.Event()
+
+    async def long_task(emit) -> dict:
+        started.set()
+        await asyncio.sleep(60)
+        return {}
+
+    job = mgr.create("demo")
+    mgr.submit(job, long_task)
+    await started.wait()  # ensure the coroutine is actually running before cancelling
+
+    assert mgr.cancel(job.id) is True
+    with pytest.raises(asyncio.CancelledError):
+        await mgr._tasks[job.id]
+    assert job.status is JobStatus.failed
+    assert job.error == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminal_job_returns_false() -> None:
+    mgr = JobManager()
+
+    async def task(emit) -> dict:
+        return {}
+
+    job = mgr.create("demo")
+    mgr.submit(job, task)
+    await mgr._tasks[job.id]
+
+    assert mgr.cancel(job.id) is False

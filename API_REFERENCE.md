@@ -41,16 +41,20 @@ All resource endpoints are prefixed with `/v1`. Utility endpoints (`/health`, `/
 
 ## Authentication
 
-Authentication is **optional** and controlled by `AUTH_ENABLED` (default: `false`).
+Authentication is **enabled by default** (`AUTH_ENABLED=true`). `/v1/research` triggers dozens of
+billed LLM calls on your provider keys, so an open instance costs real money — the app **refuses to
+start** when `AUTH_ENABLED=true` and `API_KEYS` is empty, rather than accepting every request.
 
-When enabled, every `/v1/*` endpoint requires a valid API key. Send it in either header — the first one found is used:
+Every `/v1/*` endpoint requires a valid API key. Send it in either header — the first one found is used:
 
 | Header | Format |
 |---|---|
 | `Authorization` | `Bearer <key>` |
 | `X-API-Key` | `<key>` |
 
-Valid keys are set via the `API_KEYS` environment variable (comma-separated list).
+Valid keys are set via the `API_KEYS` environment variable (comma-separated list). Generate one with
+`openssl rand -hex 32`. Keys are compared in constant time and are never written to the logs.
+`/health` and `/` stay open so probes keep working.
 
 **401 response when auth fails:**
 
@@ -72,9 +76,9 @@ Every response includes an `X-Request-ID` header. The server either mirrors the 
 
 ## Rate limiting
 
-Controlled by `RATE_LIMIT_ENABLED` (default: `false`) and `RATE_LIMIT_RPM` (default: `120`).
+Enabled by default (`RATE_LIMIT_ENABLED=true`), at `RATE_LIMIT_RPM` requests per minute (default `120`).
 
-When enabled, requests are counted per client IP over a sliding 60-second window. Exceeding the limit returns:
+Requests are counted per client IP over a sliding 60-second window. Exceeding the limit returns:
 
 ```
 HTTP 429 Too Many Requests
@@ -97,7 +101,7 @@ All errors follow FastAPI's default structure:
 
 | Status | Meaning |
 |---|---|
-| `400` | Bad request / validation error |
+| `400` | Bad request / validation error, or a URL refused by the network guard |
 | `401` | Missing or invalid API key |
 | `404` | Resource not found (e.g. unknown job ID) |
 | `429` | Rate limit exceeded |
@@ -219,7 +223,10 @@ curl -X POST http://localhost:8000/v1/search \
 
 ### POST /v1/crawl
 
-Crawls one or more URLs and returns their content as clean Markdown. Requests are executed concurrently (up to `CRAWL_MAX_CONCURRENCY`).
+Crawls one or more URLs and returns their content as clean Markdown. Requests are executed concurrently, up to `CRAWL_MAX_CONCURRENCY` browser sessions shared across the whole process.
+
+Every URL goes through the [network guard](#network-guard-ssrf) first: private and loopback targets
+are refused. Results are returned in the order they were requested, one entry per requested URL.
 
 **Auth required:** When `AUTH_ENABLED=true`
 
@@ -639,17 +646,33 @@ All settings are environment variables (case-insensitive). Copy `.env.example` t
 
 | Variable | Default | Description |
 |---|---|---|
-| `AUTH_ENABLED` | `false` | Require API key on all `/v1/*` routes |
-| `API_KEYS` | `""` | Comma-separated list of valid API keys |
+| `AUTH_ENABLED` | `true` | Require API key on all `/v1/*` routes. Startup fails if `API_KEYS` is empty |
+| `API_KEYS` | `""` | Comma-separated list of valid API keys (`openssl rand -hex 32`) |
 
 ### Hardening
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATE_LIMIT_ENABLED` | `false` | Enable per-IP rate limiting |
+| `RATE_LIMIT_ENABLED` | `true` | Enable per-IP rate limiting |
 | `RATE_LIMIT_RPM` | `120` | Max requests per minute per IP |
+| `RATE_LIMIT_MAX_CLIENTS` | `10000` | Max distinct clients tracked (coldest evicted first) |
 | `SECURITY_HEADERS` | `true` | Add `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` headers |
 | `CORS_ORIGINS` | `*` | Comma-separated list of allowed CORS origins |
+
+### Network guard (SSRF)
+
+Every URL the crawler is given is checked before the browser connects, and again on the URL the
+crawl landed on (so a redirect cannot reach the internal network). Hostnames are resolved first:
+loopback, private, link-local and CGNAT addresses are refused, as are non-`http(s)` schemes.
+A request whose URLs are *all* refused returns `400`; in a mixed batch the refused URLs come back
+as `success: false` with a `blocked: …` error.
+
+| Variable | Default | Description |
+|---|---|---|
+| `CRAWL_ALLOW_PRIVATE_NETWORKS` | `false` | Allow crawling private/loopback addresses. Never enable in production |
+| `CRAWL_ALLOWED_PORTS` | `80,443,8080` | Ports the crawler may connect to |
+| `CRAWL_DOMAIN_ALLOWLIST` | `""` | If set, only these domains (and subdomains) may be crawled |
+| `CRAWL_DOMAIN_DENYLIST` | `""` | Domains (and subdomains) never fetched |
 
 ### SearXNG
 
@@ -677,8 +700,18 @@ Any other provider API key recognised by [litellm](https://docs.litellm.ai/docs/
 
 | Variable | Default | Description |
 |---|---|---|
-| `CRAWL_MAX_CONCURRENCY` | `5` | Max concurrent browser crawl tasks |
+| `CRAWL_MAX_CONCURRENCY` | `5` | Max concurrent browser sessions, **process-wide** (not per request) |
 | `CRAWL_TIMEOUT` | `30.0` | Per-page crawl timeout in seconds |
+| `CRAWL_PER_HOST_DELAY` | `1.0` | Min seconds between two hits on the same host; distinct hosts are never delayed |
+
+### Jobs
+
+| Variable | Default | Description |
+|---|---|---|
+| `JOB_RETENTION_SECONDS` | `3600` | Seconds a finished job and its result are kept |
+| `JOB_EVICT_INTERVAL_SECONDS` | `300` | Sweep interval for aged-out jobs (`0` disables) |
+| `JOB_MAX_PROGRESS_EVENTS` | `500` | Progress events retained per job (oldest dropped) |
+| `JOB_SUBSCRIBER_QUEUE_SIZE` | `1000` | Buffered events per SSE subscriber; a slow client loses the oldest |
 
 ### Research
 
@@ -686,7 +719,8 @@ Any other provider API key recognised by [litellm](https://docs.litellm.ai/docs/
 |---|---|---|
 | `RESEARCH_DEFAULT_BREADTH` | `4` | Default SERP queries per recursion level |
 | `RESEARCH_DEFAULT_DEPTH` | `2` | Default recursion depth |
-| `RESEARCH_CONCURRENCY` | `2` | Parallel query workers during research |
+| `RESEARCH_CONCURRENCY` | `2` | Parallel query workers, **for the whole run** (not per recursion level) |
+| `RESEARCH_REPORT_TOKEN_BUDGET` | `12000` | Token budget for the learnings fed to the final-report prompt |
 
 ---
 

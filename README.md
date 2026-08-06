@@ -25,10 +25,19 @@ FastAPI  ──┬── /v1/search       → SearXNG
 
 ```bash
 cp .env.example .env
-# edit .env: set at least one provider key (e.g. OPENAI_API_KEY) and SEARXNG_SECRET
+# edit .env — required before the API will start:
+#   API_KEYS        at least one key (generate: openssl rand -hex 32)
+#   SEARXNG_SECRET  openssl rand -hex 32
+#   one provider key, e.g. OPENAI_API_KEY
 docker compose up --build
-curl http://localhost:8000/health
+curl -H "X-API-Key: <your key>" http://localhost:8000/v1/search -d '{"q":"hello"}'
+curl http://localhost:8000/health   # liveness, never authenticated
 ```
+
+Auth is **on by default**: `/v1/research` spends real money on your provider keys, so
+the app refuses to start with `AUTH_ENABLED=true` and an empty `API_KEYS`. For a
+throwaway local run, set `AUTH_ENABLED=false` (a warning is logged unless
+`ENVIRONMENT=development`).
 
 ## Local development
 
@@ -54,10 +63,26 @@ Interactive API docs are served at `/docs`.
 
 ## Security & hardening
 
-- **API-key auth** (`AUTH_ENABLED=true`) — send `Authorization: Bearer <key>` or `X-API-Key`.
-- **Rate limiting** per client IP (`RATE_LIMIT_ENABLED`, `RATE_LIMIT_RPM`).
+- **API-key auth, on by default** — send `Authorization: Bearer <key>` or `X-API-Key`.
+  Keys are compared in constant time and never logged. The app refuses to start
+  with auth enabled and no key configured.
+- **SSRF guard on every crawled URL** — hostnames are resolved before the browser
+  connects, and loopback / private / link-local / CGNAT addresses are refused, as
+  are non-`http(s)` schemes and ports outside `CRAWL_ALLOWED_PORTS`. The check runs
+  again on the URL a crawl landed on, so a redirect cannot reach the internal
+  network. Optional `CRAWL_DOMAIN_ALLOWLIST` / `CRAWL_DOMAIN_DENYLIST`.
+- **Rate limiting** per client IP, on by default (`RATE_LIMIT_RPM`), with a bounded
+  client table.
+- **Bounded concurrency** — `CRAWL_MAX_CONCURRENCY` caps browser sessions
+  process-wide, not per request; a research run holds one semaphore for the whole
+  run rather than one per recursion level.
+- **Bounded memory** — job progress history, SSE subscriber queues and finished
+  jobs are all capped and swept on a timer.
 - **Security headers** + per-request `X-Request-ID` on every response.
 - **CORS** origins configurable via `CORS_ORIGINS`.
+- **Container** — base images pinned by digest, dependencies installed from
+  `uv.lock`, runtime as a non-root user, SearXNG reachable only on the internal
+  compose network.
 - In-flight jobs are cancelled cleanly on shutdown.
 
 ## Configuration
@@ -73,7 +98,9 @@ All settings are environment variables — see [`.env.example`](.env.example).
 - [x] **Phase 4** — `/v1/research` deep-research engine (recursive breadth/depth, structured learnings, tri-state clarification)
 - [x] **Phase 5** — Async jobs + SSE streaming (`/v1/jobs/{id}`, `/stream`), background research, `/v1/crawl/site` (deep crawl)
 - [x] **Phase 6** — Hardening: rate limiting, security headers, request IDs, graceful job shutdown, CORS config, docs & Docker polish
-- [ ] **Future** — Optional Redis-backed job/report persistence (the job store is already abstracted for it)
+- [x] **Phase 7** — Correctness & security: SSRF guard, global concurrency caps, bounded job/SSE/rate-limit memory, constant-time auth on by default, container hardening
+- [ ] **Phase 8** — Hot-path performance: ASGI middlewares, GZip + ORJSON, non-blocking tiktoken, search single-flight, LLM retry/timeout/fallback
+- [ ] **Later** — see [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) for phases 9–13
 
 ## License
 

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -94,6 +96,72 @@ async def test_run_depth_two_recurses() -> None:
     # so one extra query per branch -> 3 generate calls, 4 queries total.
     assert llm.serp_calls == 3
     assert len(result.serp_queries) == 4
+
+
+class CountingCrawler:
+    """Tracks how many crawls the engine has in flight at once."""
+
+    def __init__(self, delay: float = 0.01) -> None:
+        self.delay = delay
+        self.in_flight = 0
+        self.peak = 0
+
+    async def crawl(self, req) -> list[CrawledPage]:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(self.delay)
+            return [
+                CrawledPage(url=str(u), success=True, status_code=200, markdown=f"c {u}")
+                for u in req.urls
+            ]
+        finally:
+            self.in_flight -= 1
+
+
+@pytest.mark.asyncio
+async def test_concurrency_is_capped_across_recursion_levels() -> None:
+    """The semaphore used to be recreated per level, so real concurrency was
+    `concurrency ** depth` — 8 simultaneous branches at concurrency=2, depth=3."""
+    crawler = CountingCrawler()
+    engine = DeepResearchEngine(
+        searxng=FakeSearxng(), crawler=crawler, llm=FakeLLM(), concurrency=2
+    )
+
+    await engine.run("topic", breadth=4, depth=3)
+
+    assert crawler.peak <= 2
+
+
+@pytest.mark.asyncio
+async def test_learnings_are_trimmed_to_the_report_token_budget() -> None:
+    """An overflowing report prompt would waste the whole run at the last step."""
+    captured: list[list[str]] = []
+
+    class CapturingLLM(FakeLLM):
+        async def structured(self, messages, response_model, *, model=None, **kwargs):
+            if response_model.__name__ == "SerpProcessing":
+                return SerpProcessing(
+                    learnings=[f"learning {i} " + "word " * 50 for i in range(20)],
+                    follow_up_questions=[],
+                )
+            if response_model.__name__ == "ReportDraft":
+                captured.append(messages[-1]["content"].split("\n"))
+            return await super().structured(messages, response_model, model=model, **kwargs)
+
+    engine = DeepResearchEngine(
+        searxng=FakeSearxng(),
+        crawler=FakeCrawler(),
+        llm=CapturingLLM(),
+        concurrency=2,
+        report_token_budget=200,
+    )
+    result = await engine.run("topic", breadth=2, depth=1)
+
+    prompt = "\n".join(captured[0])
+    assert "learning 0" in prompt
+    assert "learning 19" not in prompt  # dropped: the budget ran out first
+    assert len(result.learnings) == 20  # the response still reports everything found
 
 
 @pytest.mark.asyncio

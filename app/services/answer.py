@@ -7,15 +7,19 @@ full deep-research engine.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 
 from app.core.crawl.crawler import CrawlerService
 from app.core.llm.client import LLMClient
 from app.core.llm.tokens import trim_to_tokens
+from app.core.net.guard import BlockedUrlError
 from app.core.search.searxng import SearxngClient
 from app.models.answer import AnswerRequest, AnswerResponse, Source
 from app.models.crawl import CrawlRequest
 from app.models.search import SearchRequest
+
+logger = logging.getLogger("unified_search_api.answer")
 
 # Total budget for the source context fed to the model.
 _CONTEXT_TOKEN_BUDGET = 6000
@@ -40,6 +44,21 @@ class AnswerService:
         self._crawler = crawler
         self._llm = llm
 
+    async def _fetch_full_text(self, sources: list[Source]) -> dict[str, str]:
+        """Crawl the sources, best-effort. Snippets are the fallback, not an error.
+
+        The network guard can refuse every result (a narrow domain allowlist, say);
+        answering from snippets beats failing the request.
+        """
+        try:
+            pages = await self._crawler.crawl(
+                CrawlRequest(urls=[s.url for s in sources], content_filter="pruning")
+            )
+        except BlockedUrlError as exc:
+            logger.info("Answer crawl skipped, every source was blocked: %s", exc)
+            return {}
+        return {_norm_url(p.url): p.markdown for p in pages if p.success and p.markdown}
+
     async def answer(self, req: AnswerRequest) -> AnswerResponse:
         search = await self._searxng.search(
             SearchRequest(
@@ -60,12 +79,7 @@ class AnswerService:
         # pydantic's AnyHttpUrl and the crawler may add/drop a trailing slash.
         full_text: dict[str, str] = {}
         if req.fetch_full and top:
-            pages = await self._crawler.crawl(
-                CrawlRequest(urls=[s.url for s in sources], content_filter="pruning")
-            )
-            full_text = {
-                _norm_url(p.url): p.markdown for p in pages if p.success and p.markdown
-            }
+            full_text = await self._fetch_full_text(sources)
 
         per_source_budget = max(_CONTEXT_TOKEN_BUDGET // max(len(sources), 1), 200)
         blocks: list[str] = []
@@ -118,12 +132,7 @@ class AnswerService:
         full_text: dict[str, str] = {}
         if req.fetch_full and top:
             yield {"event": "crawling", "data": json.dumps({"count": len(top)})}
-            pages = await self._crawler.crawl(
-                CrawlRequest(urls=[s.url for s in sources], content_filter="pruning")
-            )
-            full_text = {
-                _norm_url(p.url): p.markdown for p in pages if p.success and p.markdown
-            }
+            full_text = await self._fetch_full_text(sources)
 
         per_source_budget = max(_CONTEXT_TOKEN_BUDGET // max(len(sources), 1), 200)
         blocks: list[str] = []

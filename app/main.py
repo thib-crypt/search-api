@@ -15,6 +15,7 @@ from app.api.routes import answer, crawl, health, jobs, research, search
 from app.config import get_settings
 from app.core.crawl.crawler import CrawlerService
 from app.core.llm.client import LLMClient
+from app.core.net.guard import UrlGuard
 from app.core.search.searxng import SearxngClient
 from app.jobs.manager import JobManager
 
@@ -26,7 +27,21 @@ logging.basicConfig(level=settings.log_level)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Read the settings again at startup rather than reusing the import-time copy,
+    # so the running app reflects the environment it was actually started in.
+    settings = get_settings()
+    # Refuse to serve a configuration that would leave the API (and the provider
+    # bill behind it) open. Raising here aborts startup.
+    settings.validate_startup()
+    if not settings.auth_enabled and settings.environment != "development":
+        logger.warning(
+            "AUTH_ENABLED is false in environment=%s: every caller can spend your "
+            "LLM credits through /v1/research. Set AUTH_ENABLED=true and API_KEYS.",
+            settings.environment,
+        )
+
     # Shared async clients live on app.state for the process lifetime.
+    app.state.url_guard = UrlGuard.from_settings(settings)
     app.state.searxng = SearxngClient(
         base_url=settings.searxng_url,
         timeout=settings.searxng_timeout,
@@ -37,14 +52,23 @@ async def lifespan(app: FastAPI):
     # The browser pool starts lazily on the first crawl, so creating the service
     # here is cheap and keeps startup fast.
     app.state.crawler = CrawlerService(
-        max_concurrency=settings.crawl_max_concurrency, timeout=settings.crawl_timeout
+        max_concurrency=settings.crawl_max_concurrency,
+        timeout=settings.crawl_timeout,
+        guard=app.state.url_guard,
+        per_host_delay=settings.crawl_per_host_delay,
     )
     app.state.llm = LLMClient(
         default_model=settings.llm_model,
         temperature=settings.llm_temperature,
         max_tokens=settings.llm_max_tokens,
     )
-    app.state.jobs = JobManager(retention_seconds=settings.job_retention_seconds)
+    app.state.jobs = JobManager(
+        retention_seconds=settings.job_retention_seconds,
+        evict_interval_seconds=settings.job_evict_interval_seconds,
+        max_progress_events=settings.job_max_progress_events,
+        subscriber_queue_size=settings.job_subscriber_queue_size,
+    )
+    app.state.jobs.start()
     try:
         yield
     finally:

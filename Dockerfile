@@ -1,24 +1,46 @@
 # crawl4ai ships a base image with Playwright + Chromium already installed,
 # which saves a lengthy browser install step.
-FROM unclecode/crawl4ai:latest
+#
+# Pinned by digest, not by tag: `:latest` silently changes the Chromium build and
+# the crawl4ai version under an unchanged Dockerfile. This digest is the
+# crawl4ai 0.8.9 multi-arch index — the same version uv.lock pins, so the image
+# and the installed package cannot drift apart. To move: bump uv.lock first, then
+# read the matching digest from
+# `docker buildx imagetools inspect unclecode/crawl4ai:<tag>`.
+FROM unclecode/crawl4ai@sha256:b243f684ad20f71ee108ab3fc3f31f3349eb5b31a9947b9e563d868417141aad
 
-# crawl4ai's base image runs as a non-root user. Switch to root so we can
-# install system-wide; the COPY --chmod below also normalizes file modes,
-# which matters when the build context carries restrictive permissions
-# (e.g. files checked out on a NAS with a tight umask).
+# The base image runs as the unprivileged `appuser`. Root is needed only to
+# install system-wide; the final USER below drops back. The COPY --chmod flags
+# also normalize file modes, which matters when the build context carries
+# restrictive permissions (e.g. files checked out on a NAS with a tight umask).
 USER root
 
 WORKDIR /srv/api
 
-# uv for fast, reproducible installs.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# uv for fast, reproducible installs. Pinned by digest for the same reason.
+COPY --from=ghcr.io/astral-sh/uv@sha256:069a51314a7bb6031777a9273205fe1b0b19e914ef418207d1338b268df641dd /uv /usr/local/bin/uv
 
-# Install dependencies first for better layer caching.
-COPY --chmod=644 pyproject.toml README.md ./
-RUN uv pip install --system --no-cache .
+# Dependencies come from uv.lock, not from the loose ranges in pyproject.toml, so
+# a rebuild installs the exact versions that were tested. --locked fails the build
+# if the lock has drifted from pyproject rather than silently re-resolving.
+COPY --chmod=644 pyproject.toml uv.lock README.md ./
+RUN uv export --locked --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
-# App source.
+# The pinned playwright above may differ from the one the base image installed its
+# browsers for, and playwright looks up Chromium under a version-stamped directory.
+# Install the matching build into a shared, world-readable path so it resolves the
+# same whether the process runs as root (build) or appuser (runtime).
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install chromium && chmod -R a+rX /ms-playwright
+
+# App source. Installed with --no-deps: everything it needs is already pinned above.
 COPY --chmod=755 app ./app
+RUN uv pip install --system --no-cache --no-deps .
+
+# Back to the base image's unprivileged user for runtime.
+USER appuser
 
 EXPOSE 8000
 

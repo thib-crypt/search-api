@@ -9,16 +9,27 @@ services:
       # Override so the API reaches SearXNG via the compose network.
       SEARXNG_URL: http://searxng:8080
     depends_on:
-      - searxng
+      searxng:
+        # Without this the API's first searches fail while SearXNG is still booting.
+        condition: service_healthy
     restart: unless-stopped
 
   searxng:
     image: searxng/searxng:latest
-    ports:
-      - "8080:8080"
+    # Deliberately not published: the API is SearXNG's only client and reaches it
+    # over the compose network. Publishing 8080 would expose an unauthenticated
+    # search backend on the host — and give an SSRF payload something to aim at.
+    expose:
+      - "8080"
     volumes:
       - ./searxng:/etc/searxng:rw
     environment:
-      SEARXNG_BASE_URL: http://localhost:8080/
+      SEARXNG_BASE_URL: http://searxng:8080/
       SEARXNG_SECRET: ${SEARXNG_SECRET:-change-me-please}
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped

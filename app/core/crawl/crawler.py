@@ -1,46 +1,87 @@
 """Crawling service built on crawl4ai.
 
 Wraps a single long-lived ``AsyncWebCrawler`` (one browser pool for the process)
-and exposes a small, typed surface used by the API. Single and multi-URL crawls
-both flow through :meth:`crawl`; multi-URL uses crawl4ai's memory-adaptive
-dispatcher for bounded concurrency and per-host rate limiting.
+and exposes a small, typed surface used by the API.
+
+Three properties matter here and are enforced by this module, not by callers:
+
+* **Every URL passes the SSRF guard** (`app.core.net.guard`) before the browser
+  sees it, and again on the URL the crawl landed on, so a redirect cannot walk
+  into the private network.
+* **Concurrency is bounded process-wide.** A single ``asyncio.Semaphore`` owned
+  by the service caps concurrent browser sessions across all in-flight requests;
+  a per-request dispatcher could not (N requests × 5 sessions each).
+* **Results are paired with the URL that was asked for.** Each URL is crawled
+  through its own ``arun`` call, so a missing or reordered result cannot be
+  silently attributed to the wrong URL — any URL without a result comes back as
+  an explicit failure.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from crawl4ai import (
     AsyncWebCrawler,
     BrowserConfig,
     CacheMode,
     CrawlerRunConfig,
-    MemoryAdaptiveDispatcher,
-    RateLimiter,
 )
 from crawl4ai.content_filter_strategy import PruningContentFilter
 from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
 from crawl4ai.deep_crawling.filters import FilterChain, URLPatternFilter
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 
+from app.core.net.guard import BlockedUrlError, UrlGuard
 from app.jobs.manager import Emit
 from app.models.crawl import CrawledPage, CrawlRequest, SiteCrawlRequest
 
+# Above this many tracked hosts, expired politeness entries are swept.
+_HOST_GATE_HIGH_WATER = 2048
+
 
 class CrawlerService:
-    def __init__(self, max_concurrency: int = 5, timeout: float = 30.0) -> None:
-        self._max_concurrency = max_concurrency
+    def __init__(
+        self,
+        max_concurrency: int = 5,
+        timeout: float = 30.0,
+        *,
+        guard: UrlGuard | None = None,
+        per_host_delay: float = 1.0,
+    ) -> None:
+        self._max_concurrency = max(max_concurrency, 1)
         self._timeout_ms = int(timeout * 1000)
         self._crawler = AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False))
         self._started = False
+        self._start_lock = asyncio.Lock()
+        # Process-wide cap on concurrent browser sessions. Held for the duration of
+        # one page fetch (or one whole site crawl).
+        self._sessions = asyncio.Semaphore(self._max_concurrency)
+        self._guard = guard or UrlGuard()
+        # Politeness: earliest monotonic time each host may be hit again.
+        self._per_host_delay = max(per_host_delay, 0.0)
+        self._host_gate: dict[str, float] = {}
+
+    @property
+    def max_concurrency(self) -> int:
+        return self._max_concurrency
 
     async def start(self) -> None:
-        if not self._started:
+        # Double-checked under a lock: two concurrent first requests would
+        # otherwise each start a browser pool, and the first would leak.
+        if self._started:
+            return
+        async with self._start_lock:
+            if self._started:
+                return
             await self._crawler.start()
             self._started = True
 
     async def close(self) -> None:
-        if self._started:
-            await self._crawler.close()
-            self._started = False
+        async with self._start_lock:
+            if self._started:
+                await self._crawler.close()
+                self._started = False
 
     def _run_config(self, req: CrawlRequest) -> CrawlerRunConfig:
         content_filter = (
@@ -62,40 +103,53 @@ class CrawlerService:
         )
 
     async def crawl(self, req: CrawlRequest) -> list[CrawledPage]:
-        await self.start()
         config = self._run_config(req)
         urls = [str(u) for u in req.urls]
 
-        if len(urls) == 1:
-            result = await self._crawler.arun(url=urls[0], config=config)
-            return [
-                self._to_page(
-                    urls[0],
-                    result,
-                    content_filter=req.content_filter,
-                    include_raw=req.include_raw_markdown,
-                )
-            ]
-
-        dispatcher = MemoryAdaptiveDispatcher(
-            max_session_permit=self._max_concurrency,
-            rate_limiter=RateLimiter(base_delay=(1.0, 3.0), max_delay=60.0, max_retries=3),
-        )
-        results = await self._crawler.arun_many(urls=urls, config=config, dispatcher=dispatcher)
-        return [
-            self._to_page(
-                getattr(r, "url", url),
-                r,
-                content_filter=req.content_filter,
-                include_raw=req.include_raw_markdown,
+        allowed, rejected = await self._guard.partition(urls)
+        if not allowed:
+            # Nothing left to do: surface it as a client error rather than a
+            # 200 full of failures.
+            raise BlockedUrlError(
+                "; ".join(f"{url} ({reason})" for url, reason in rejected.items())
             )
-            for url, r in zip(urls, results, strict=False)
+
+        await self.start()
+        pages = await asyncio.gather(
+            *(self._crawl_one(url, config, req) for url in allowed)
+        )
+        by_url = dict(zip(allowed, pages, strict=True))
+        # Preserve the caller's order and answer for every URL, including blocked ones.
+        return [
+            by_url[url]
+            if url in by_url
+            else _blocked_page(url, rejected.get(url, "no result returned by the crawler"))
+            for url in urls
         ]
+
+    async def _crawl_one(
+        self, url: str, config: CrawlerRunConfig, req: CrawlRequest
+    ) -> CrawledPage:
+        await self._await_host_slot(url)
+        async with self._sessions:
+            try:
+                result = await self._crawler.arun(url=url, config=config)
+            except Exception as exc:  # one bad URL must not sink the whole batch
+                return CrawledPage(url=url, success=False, error=f"crawl failed: {exc}")
+
+        page = self._to_page(
+            url,
+            result,
+            content_filter=req.content_filter,
+            include_raw=req.include_raw_markdown,
+        )
+        return await self._guard_landing(url, page)
 
     async def crawl_site(
         self, req: SiteCrawlRequest, emit: Emit | None = None
     ) -> list[CrawledPage]:
         """Deep-crawl a whole site (BFS), streaming pages as they are discovered."""
+        await self._guard.check(str(req.url))
         await self.start()
 
         filters = []
@@ -123,26 +177,64 @@ class CrawlerService:
         )
 
         pages: list[CrawledPage] = []
-        container = await self._crawler.arun(url=str(req.url), config=config)
-        if hasattr(container, "__aiter__"):
-            async for result in container:
-                pages.append(await self._collect(result, req, emit, len(pages) + 1))
-        else:  # non-streaming fallback
-            for result in container:
-                pages.append(await self._collect(result, req, emit, len(pages) + 1))
+        # A deep crawl drives its own link expansion, so it counts as one session
+        # against the global cap for its whole duration.
+        async with self._sessions:
+            container = await self._crawler.arun(url=str(req.url), config=config)
+            if hasattr(container, "__aiter__"):
+                async for result in container:
+                    pages.append(await self._collect(result, req, emit, len(pages) + 1))
+            else:  # non-streaming fallback
+                for result in container:
+                    pages.append(await self._collect(result, req, emit, len(pages) + 1))
         return pages
 
     async def _collect(
         self, result: object, req: SiteCrawlRequest, emit: Emit | None, count: int
     ) -> CrawledPage:
-        page = self._to_page(
-            getattr(result, "url", str(req.url)),
-            result,
-            content_filter=req.content_filter,
-        )
+        url = getattr(result, "url", str(req.url))
+        page = self._to_page(url, result, content_filter=req.content_filter)
+        # Links discovered mid-crawl were never validated by the caller: a page on a
+        # public site can link straight at an internal host.
+        page = await self._guard_landing(url, page)
         if emit is not None:
             await emit({"stage": "crawled", "pages": count, "url": page.url})
         return page
+
+    async def _guard_landing(self, requested: str, page: CrawledPage) -> CrawledPage:
+        """Re-check the URL the crawl actually landed on (redirects, DNS rebinding)."""
+        landed = page.url or requested
+        if landed == requested:
+            return page
+        try:
+            await self._guard.check(landed)
+        except BlockedUrlError as exc:
+            return _blocked_page(requested, f"redirected to a blocked URL: {exc}")
+        return page
+
+    async def _await_host_slot(self, url: str) -> None:
+        """Space out consecutive hits on the same host without delaying distinct ones.
+
+        crawl4ai's dispatcher applies a 1–3 s delay to every URL in a batch, even
+        when they are all on different hosts — which is the common case for search
+        results. This only waits when the same host was just fetched.
+        """
+        if self._per_host_delay <= 0:
+            return
+        try:
+            host, _ = self._guard.check_syntax(url)
+        except BlockedUrlError:  # pragma: no cover - already filtered upstream
+            return
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        ready_at = self._host_gate.get(host, 0.0)
+        # Reserve the slot before awaiting so concurrent callers queue behind us.
+        self._host_gate[host] = max(now, ready_at) + self._per_host_delay
+        if len(self._host_gate) > _HOST_GATE_HIGH_WATER:
+            self._host_gate = {h: t for h, t in self._host_gate.items() if t > now}
+        if ready_at > now:
+            await asyncio.sleep(ready_at - now)
 
     @staticmethod
     def _to_page(
@@ -177,6 +269,10 @@ class CrawlerService:
             internal_links=len(links.get("internal", []) or []) if isinstance(links, dict) else 0,
             external_links=len(links.get("external", []) or []) if isinstance(links, dict) else 0,
         )
+
+
+def _blocked_page(url: str, reason: str) -> CrawledPage:
+    return CrawledPage(url=url, success=False, error=f"blocked: {reason}")
 
 
 def _extract_markdown(md: object) -> tuple[str, str]:

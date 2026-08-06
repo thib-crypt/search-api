@@ -7,7 +7,7 @@ via the environment without re-importing the app.
 from __future__ import annotations
 
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from uuid import uuid4
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -19,14 +19,34 @@ from app.config import get_settings
 # Paths that should never be rate limited.
 _EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
 
-# Per-IP sliding window of request timestamps (monotonic seconds).
-_HITS: dict[str, deque[float]] = defaultdict(deque)
+# Per-client sliding window of request timestamps (monotonic seconds).
+# An OrderedDict keyed in insertion order so the coldest client is evicted first
+# when the table hits its cap. Plain dict growth was unbounded: every IP ever
+# seen kept an entry for the process lifetime, which a distributed client (or
+# any IPv6 traffic) turns into a slow leak.
+_HITS: OrderedDict[str, deque[float]] = OrderedDict()
 _WINDOW = 60.0
+# How often the stale-entry sweep runs, at most.
+_PURGE_INTERVAL = 60.0
+_last_purge = 0.0
 
 
 def reset_rate_limiter() -> None:
     """Clear all rate-limit state (used by tests)."""
+    global _last_purge
     _HITS.clear()
+    _last_purge = 0.0
+
+
+def _purge(now: float, max_clients: int) -> None:
+    """Drop windows with no recent hits, then cap the table size."""
+    global _last_purge
+    if now - _last_purge >= _PURGE_INTERVAL:
+        _last_purge = now
+        for client in [c for c, hits in _HITS.items() if not hits or now - hits[-1] > _WINDOW]:
+            del _HITS[client]
+    while len(_HITS) > max_clients:
+        _HITS.popitem(last=False)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -65,7 +85,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         else:
             client_ip = request.client.host if request.client else "unknown"
         now = time.monotonic()
-        hits = _HITS[client_ip]
+        _purge(now, settings.rate_limit_max_clients)
+        hits = _HITS.get(client_ip)
+        if hits is None:
+            hits = _HITS[client_ip] = deque()
+        else:
+            _HITS.move_to_end(client_ip)
         while hits and now - hits[0] > _WINDOW:
             hits.popleft()
 

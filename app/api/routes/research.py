@@ -47,6 +47,7 @@ async def research(
         llm=llm,
         concurrency=settings.research_concurrency,
         report_model=settings.report_model,
+        report_token_budget=settings.research_report_token_budget,
     )
     model_label = req.model or settings.report_model
     answers = req.answers or []

@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import hmac
+
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
 from app.core.crawl.crawler import CrawlerService
 from app.core.llm.client import LLMClient
+from app.core.net.guard import UrlGuard
 from app.core.search.searxng import SearxngClient
 from app.jobs.manager import JobManager
+
+
+def _key_accepted(provided: str, keys: set[str]) -> bool:
+    """Compare against every configured key in constant time.
+
+    ``provided in keys`` short-circuits on the first differing byte, which leaks
+    key material through response timing. Every candidate is compared in full,
+    and the loop is not cut short on a match.
+    """
+    accepted = False
+    for key in keys:
+        if hmac.compare_digest(provided, key):
+            accepted = True
+    return accepted
 
 
 async def require_api_key(
@@ -16,7 +33,10 @@ async def require_api_key(
     x_api_key: str | None = Header(default=None),
     settings: Settings = Depends(get_settings),
 ) -> None:
-    """Enforce API-key auth when AUTH_ENABLED is true; otherwise a no-op."""
+    """Enforce API-key auth when AUTH_ENABLED is true; otherwise a no-op.
+
+    The key itself is never logged, not even truncated.
+    """
     if not settings.auth_enabled:
         return
 
@@ -24,7 +44,7 @@ async def require_api_key(
     if not provided and authorization and authorization.lower().startswith("bearer "):
         provided = authorization[7:].strip()
 
-    if not provided or provided not in settings.api_key_set:
+    if not provided or not _key_accepted(provided, settings.api_key_set):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid API key.",
@@ -51,6 +71,13 @@ def get_llm(request: Request) -> LLMClient:
     if llm is None:  # pragma: no cover - defensive
         raise HTTPException(status_code=503, detail="LLM client not initialized.")
     return llm
+
+
+def get_url_guard(request: Request) -> UrlGuard:
+    guard: UrlGuard | None = getattr(request.app.state, "url_guard", None)
+    if guard is None:  # pragma: no cover - defensive
+        return UrlGuard.from_settings(get_settings())
+    return guard
 
 
 def get_jobs(request: Request) -> JobManager:

@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  # `pip` is the ecosystem name GitHub uses for anything declaring dependencies in
+  # `pyproject.toml`, uv included: it reads the manifest and updates `uv.lock`
+  # alongside it. There is no separate "uv" ecosystem to select.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the dev toolchain: ruff/mypy/pytest bumps are reviewed as a
+      # batch and never affect the runtime image.
+      dev-tooling:
+        dependency-type: "development"
+      # Patch bumps of runtime deps are the boring majority; keeping them in one
+      # PR leaves the limit above free for the minor/major ones worth reading.
+      runtime-patch:
+        dependency-type: "production"
+        update-types: ["patch"]
+    labels: ["dependencies"]
+
+  # The workflow pins `actions/checkout@v4` and `astral-sh/setup-uv@v5`; without
+  # this they silently rot.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels: ["dependencies", "docker"]

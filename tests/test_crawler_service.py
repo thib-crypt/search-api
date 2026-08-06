@@ -13,7 +13,7 @@ import pytest
 
 from app.core.crawl.crawler import CrawlerService
 from app.core.net.guard import BlockedUrlError, UrlGuard
-from app.models.crawl import CrawlRequest
+from app.models.crawl import CrawlRequest, SiteCrawlRequest
 
 
 def _ok(url: str, markdown: str = "body"):
@@ -85,9 +85,7 @@ async def test_cap_is_global_not_per_request() -> None:
 
     await asyncio.gather(
         *(
-            service.crawl(
-                CrawlRequest(urls=[f"https://r{r}-{i}.example/" for i in range(5)])
-            )
+            service.crawl(CrawlRequest(urls=[f"https://r{r}-{i}.example/" for i in range(5)]))
             for r in range(4)
         )
     )
@@ -215,16 +213,57 @@ async def test_same_host_requests_are_spaced_out() -> None:
 
     loop = asyncio.get_running_loop()
     started = loop.time()
-    await service.crawl(
-        CrawlRequest(urls=[f"https://same.example/{i}" for i in range(3)])
-    )
+    await service.crawl(CrawlRequest(urls=[f"https://same.example/{i}" for i in range(3)]))
     same_host = loop.time() - started
 
     started = loop.time()
-    await service.crawl(
-        CrawlRequest(urls=[f"https://host{i}.example/" for i in range(3)])
-    )
+    await service.crawl(CrawlRequest(urls=[f"https://host{i}.example/" for i in range(3)]))
     distinct_hosts = loop.time() - started
 
     assert same_host >= 0.1  # two waits of 50 ms
     assert distinct_hosts < 0.05  # different hosts are never delayed
+
+
+async def test_site_crawl_re_guards_every_page_it_discovers() -> None:
+    """A deep crawl expands links itself, so nothing else can vet where it lands.
+
+    `crawl_site`'s entry URL is checked by the route and again here, but the
+    pages BFS discovers are only ever checked inside `_collect`. A public site
+    that links straight at an internal host is the whole reason that check
+    exists; nothing exercised it through the service before.
+    """
+
+    discovered = [
+        _ok("https://8.8.8.8/page-1", "public"),
+        _ok("http://127.0.0.1:8080/admin", "secrets"),
+        _ok("http://169.254.169.254/latest/meta-data/", "credentials"),
+    ]
+
+    class DeepBrowser(StubBrowser):
+        async def arun(self, url: str, config=None):
+            async def stream():
+                for result in discovered:
+                    yield result
+
+            return stream()
+
+    service = CrawlerService(guard=UrlGuard(), per_host_delay=0.0)
+    service._crawler = DeepBrowser()
+
+    pages = await service.crawl_site(SiteCrawlRequest(url="https://8.8.8.8/"))
+
+    assert len(pages) == 3
+    assert pages[0].success is True
+    for blocked in pages[1:]:
+        assert blocked.success is False
+        assert (blocked.error or "").startswith("blocked:")
+    body = " ".join(p.markdown or "" for p in pages)
+    assert "secrets" not in body and "credentials" not in body
+
+
+async def test_site_crawl_refuses_a_private_entry_point() -> None:
+    service = CrawlerService(guard=UrlGuard(), per_host_delay=0.0)
+    service._crawler = StubBrowser()
+
+    with pytest.raises(BlockedUrlError):
+        await service.crawl_site(SiteCrawlRequest(url="http://169.254.169.254/"))

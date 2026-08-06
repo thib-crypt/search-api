@@ -18,5 +18,20 @@ jobs:
         run: uv sync --extra dev
       - name: Lint
         run: uv run ruff check .
+      - name: Format
+        run: uv run ruff format --check app tests
+      # Ordered cheapest-first: a type error should not wait on the test suite.
+      # Scoped to `app` by `[tool.mypy] files`, in strict mode.
+      - name: Types
+        run: uv run mypy
+      # `--cov-fail-under` lives in `[tool.coverage.report]` (80%); real coverage
+      # is ~91%, so the gate catches a regression rather than routine drift.
       - name: Test
-        run: uv run pytest -q
+        run: uv run pytest -q --cov=app --cov-report=term-missing --cov-report=xml
+      # Informational only: latency on a shared runner is far too noisy to gate
+      # on. It measures the app's own overhead (routing, middleware,
+      # serialization) with the network faked out, so a step change in the
+      # numbers across PRs is still worth seeing in the log. See scripts/bench.py.
+      - name: Benchmark (informational)
+        run: uv run python scripts/bench.py --requests 200
+        continue-on-error: true

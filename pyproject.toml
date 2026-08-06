@@ -21,15 +21,30 @@ dependencies = [
     "python-multipart>=0.0.12",
     "sse-starlette>=2.1",
     "orjson>=3.10",
+    "pypdf>=6.15.0",
+    "aiosqlite>=0.22.1",
+    "prometheus-client>=0.26.0",
+    "opentelemetry-sdk>=1.44.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-httpx>=0.65b0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
     "respx>=0.21",
     "ruff>=0.8",
     "mypy>=1.13",
+]
+# Kept out of `dev` deliberately: locust pulls gevent, flask and a dozen other
+# packages that CI would install on every run and never use. The load tests are
+# run by hand against a real deployment (see loadtest/README.md), never in CI.
+#     uv sync --extra loadtest
+loadtest = [
+    "locust>=2.32",
 ]
 
 [project.urls]
@@ -52,9 +67,39 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # Depends()/Header() in argument defaults is the intended FastAPI idiom.
 ignore = ["B008"]
 
+[tool.mypy]
+files = ["app"]
+python_version = "3.11"
+strict = true
+# FastAPI/pydantic decorators are typed; keep the strict defaults but make the
+# reports readable.
+pretty = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+# crawl4ai ships neither stubs nor a py.typed marker; nothing to fix on our side.
+module = ["crawl4ai.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Same for the optional OTel/litellm/instructor surfaces we touch.
+module = ["litellm.*", "instructor.*", "tiktoken.*", "pypdf.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: tests that hit real network / browser (deselect with -m 'not integration')",
 ]
+
+[tool.coverage.run]
+source = ["app"]
+
+[tool.coverage.report]
+show_missing = true
+# Measured coverage is 91.9% at the Phase 13 baseline, so this is not the number
+# that makes the suite pass -- it is deliberate headroom. The gate exists to fail
+# a real regression (a module landing untested), not to police normal drift.
+# Raise it if the margin stops being useful.
+fail_under = 80

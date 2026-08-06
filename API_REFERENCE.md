@@ -11,17 +11,26 @@ Interactive docs are also served at `/docs` (Swagger UI) and `/redoc` when the s
 - [Base URL & versioning](#base-url--versioning)
 - [Authentication](#authentication)
 - [Request IDs](#request-ids)
+- [Logging](#logging)
 - [Rate limiting](#rate-limiting)
+- [Cost controls](#cost-controls)
+- [Webhooks](#webhooks)
 - [Error format](#error-format)
 - [Endpoints](#endpoints)
   - [GET /](#get-)
   - [GET /health](#get-health)
+  - [GET /health/ready](#get-healthready)
+  - [GET /metrics](#get-metrics)
   - [POST /v1/search](#post-v1search)
+  - [GET /v1/search](#get-v1search)
   - [POST /v1/crawl](#post-v1crawl)
   - [POST /v1/crawl/site](#post-v1crawlsite)
+  - [POST /v1/extract](#post-v1extract)
+  - [POST /v1/map](#post-v1map)
   - [POST /v1/answer](#post-v1answer)
   - [POST /v1/research](#post-v1research)
   - [GET /v1/jobs/{job\_id}](#get-v1jobsjob_id)
+  - [DELETE /v1/jobs/{job\_id}](#delete-v1jobsjob_id)
   - [GET /v1/jobs/{job\_id}/stream](#get-v1jobsjob_idstream)
 - [Schemas](#schemas)
 - [Configuration reference](#configuration-reference)
@@ -35,7 +44,8 @@ Interactive docs are also served at `/docs` (Swagger UI) and `/redoc` when the s
 http://<host>:8000
 ```
 
-All resource endpoints are prefixed with `/v1`. Utility endpoints (`/health`, `/`) have no prefix.
+All resource endpoints are prefixed with `/v1`. Utility endpoints (`/`, `/health`, `/health/ready`,
+`/metrics`) have no prefix.
 
 ---
 
@@ -56,15 +66,30 @@ Valid keys are set via the `API_KEYS` environment variable (comma-separated list
 `openssl rand -hex 32`. Keys are compared in constant time and are never written to the logs.
 `/health` and `/` stay open so probes keep working.
 
+### Labeled keys
+
+Each `API_KEYS` entry is either `label:key` or a bare `key`:
+
+```
+API_KEYS=app-mobile:sk_a1b2...,script-perso:sk_c3d4...,test:sk_e5f6...
+```
+
+A bare key still works (backward compatible) and receives a stable derived label. The **label** — never
+the key — is what the server uses for rate-limit buckets, daily cost counters and any log line, so giving
+each client its own label means you can see who spends what, budget them separately, and revoke one key
+by deleting a single line and restarting. With `AUTH_ENABLED=false` every caller shares the label
+`anonymous`.
+
 **401 response when auth fails:**
 
 ```json
 {
-  "detail": "Invalid or missing API key"
+  "detail": "Missing or invalid API key."
 }
 ```
 
-> `/health`, `/docs`, `/openapi.json`, and `/redoc` are always public.
+> `/`, `/health`, `/health/ready`, `/docs`, `/openapi.json`, and `/redoc` are always public.
+> `/metrics` is **not** — it publishes per-key spend, so it needs an API key like any `/v1/*` route.
 
 ---
 
@@ -74,18 +99,151 @@ Every response includes an `X-Request-ID` header. The server either mirrors the 
 
 ---
 
+## Logging
+
+`LOG_FORMAT=json` (the default) emits **one JSON object per line** on stdout:
+
+```json
+{"timestamp":"2026-01-30T10:12:44.318+00:00","level":"INFO","logger":"unified_search_api.access","message":"POST /v1/answer 200 812.4ms","request_id":"6b1c...","method":"POST","path":"/v1/answer","status_code":200,"duration_ms":812.412}
+```
+
+- `request_id` is stamped on **every** record emitted while a request is in flight — not just
+  the access line — so the log of a failing research run can be filtered down to that one request
+  with the `X-Request-ID` the client received.
+- One access line is written per request, timed around the whole exchange: an SSE response is
+  reported with the duration of its *stream*, not of its headers.
+- Exceptions carry their traceback in an `exception` field.
+
+Set `LOG_FORMAT=text` for the plain `LEVEL:logger:message [request_id=...]` one-liner when reading
+a local run by eye.
+
+---
+
 ## Rate limiting
 
-Enabled by default (`RATE_LIMIT_ENABLED=true`), at `RATE_LIMIT_RPM` requests per minute (default `120`).
+Enabled by default (`RATE_LIMIT_ENABLED=true`), at `RATE_LIMIT_RPM` **points** per 60-second sliding
+window (default `120`).
 
-Requests are counted per client IP over a sliding 60-second window. Exceeding the limit returns:
+A request costs points according to what the endpoint spends downstream, not a flat 1 — a `/v1/research`
+call is roughly a thousand times a `/v1/search` in provider spend, so a flat counter would let 120
+deep-research runs a minute through:
+
+| Path | Weight |
+|---|---|
+| `/v1/search` | 1 |
+| `/v1/map` | 2 |
+| `/v1/crawl` | 5 |
+| `/v1/answer`, `/v1/extract` | 10 |
+| `/v1/crawl/site` | 25 |
+| `/v1/research` | 100 |
+| anything else (e.g. `/v1/jobs/*`) | 1 |
+
+The window is keyed on the caller's **API-key label** when auth is enabled, and on the client IP
+otherwise — so one client exhausting its budget never starves another sharing the same egress IP.
+Per-label budgets override the global one via `RATE_LIMIT_RPM_OVERRIDES=app-mobile:500,test:20`.
+
+Every rate-limited response (not only 429s) carries the standard headers:
+
+```
+RateLimit-Limit: 120
+RateLimit-Remaining: 20
+RateLimit-Reset: 47
+```
+
+Exceeding the limit returns:
 
 ```
 HTTP 429 Too Many Requests
 Retry-After: <seconds>
 ```
 
-Exempt paths: `/health`, `/docs`, `/openapi.json`, `/redoc`.
+Exempt paths: `/health`, `/health/ready`, `/docs`, `/openapi.json`, `/redoc`, `/metrics`.
+
+---
+
+## Cost controls
+
+`/v1/research` and `/v1/answer` spend real provider credits, so three independent brakes are available.
+All are off by default.
+
+| Control | Setting | Behaviour |
+|---|---|---|
+| Per-run ceiling | `RESEARCH_MAX_COST_USD` | A run passing the ceiling stops exploring and writes its report from what it already gathered. The response carries `stopped_early: true` and the report says so. Not an error. |
+| Per-key daily cap | `DAILY_COST_CAP_USD` | Spend is totalled per API-key label per UTC day, across both endpoints. A label over its cap gets a `429` **before** any work starts, while every other label keeps working. Durable with `JOB_BACKEND=sqlite`; with `JOB_BACKEND=memory` the counters reset on restart. |
+| Dry run | `estimate_only: true` on `/v1/research` | Returns a projected cost and page count without searching, crawling or calling any model. |
+
+**429 when the daily cap is reached:**
+
+```json
+{
+  "detail": "Daily cost cap reached for this API key: $12.4100 spent of $10.00 allowed (UTC day). The budget resets at 00:00 UTC."
+}
+```
+
+### Usage accounting
+
+`/v1/answer` and `/v1/research` report what the call cost, in a `usage` object:
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 48210,
+    "completion_tokens": 3120,
+    "total_cost_usd": 0.021,
+    "searches": 12,
+    "pages_crawled": 27,
+    "pages_skipped_by_rerank": 43
+  }
+}
+```
+
+`total_cost_usd` comes from litellm's model cost map and is an **estimate**: a model litellm cannot price
+contributes tokens but no cost, so treat the figure as a floor. A cached `/v1/answer` response reports all
+zeros — replaying a stored answer spends nothing. On a streaming answer the same object is the payload of
+the final `done` event; on a background research job it is the last field of the job's `result`.
+
+---
+
+## Webhooks
+
+A background research run can take ten minutes. Instead of polling `GET /v1/jobs/{id}`, pass a
+`webhook_url` alongside `background: true` (or `stream: true`) and the server will POST the outcome when
+the job finishes — on **success and on failure**, since a client waiting for a callback needs to hear
+about both.
+
+```jsonc
+POST /v1/research
+{ "query": "...", "background": true, "webhook_url": "https://example.com/hooks/research" }
+```
+
+The callback body is JSON and carries an HMAC-SHA256 signature over the exact bytes sent:
+
+```
+POST /hooks/research
+Content-Type: application/json
+X-Webhook-Signature: sha256=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+```
+
+```jsonc
+// success
+{ "job_id": "3f2a…", "type": "research", "status": "completed", "result": { /* same shape as the job's result */ } }
+// failure
+{ "job_id": "3f2a…", "type": "research", "status": "failed", "error": "…", "usage": { /* … */ } }
+```
+
+Verify it by recomputing `hmac_sha256(WEBHOOK_SECRET, raw_body)` and comparing in constant time.
+
+Two rules to know about:
+
+- **`WEBHOOK_SECRET` must be set.** A request carrying a `webhook_url` while the secret is empty is
+  refused with a `400`: an unsigned callback cannot be authenticated by its receiver. Generate one with
+  `openssl rand -hex 32`.
+- **The URL goes through the SSRF guard.** It is a client-supplied address the *server* fetches, so it is
+  checked exactly like a crawl target — a `webhook_url` pointing at `169.254.169.254`, a private range or
+  a non-HTTP scheme is refused with a `400` before the job is created.
+
+A webhook that times out, refuses the connection or answers 5xx is logged and dropped. It never fails the
+job: the result is already stored and remains available from `GET /v1/jobs/{id}`.
 
 ---
 
@@ -101,13 +259,16 @@ All errors follow FastAPI's default structure:
 
 | Status | Meaning |
 |---|---|
-| `400` | Bad request / validation error, or a URL refused by the network guard |
+| `400` | Bad request — e.g. a URL refused by the network guard, or a `webhook_url` without `WEBHOOK_SECRET` |
 | `401` | Missing or invalid API key |
 | `404` | Resource not found (e.g. unknown job ID) |
-| `429` | Rate limit exceeded |
+| `409` | Job already in a terminal state (`DELETE /v1/jobs/{id}`) |
+| `422` | Request body failed validation, or an unusable extraction schema |
+| `429` | Rate limit exceeded, or the daily cost cap reached |
 | `500` | Unexpected server error |
 | `502` | Upstream failure (SearXNG unreachable, crawl error, LLM error) |
-| `503` | Service not yet initialised |
+| `503` | Service not yet initialised, or `/health/ready` reporting a failing dependency |
+| `504` | A synchronous `/v1/research` run exceeded `RESEARCH_SYNC_TIMEOUT` |
 
 Unhandled `500` errors include the `X-Request-ID` value in the response body to help with debugging.
 
@@ -127,7 +288,8 @@ Returns API metadata and a list of available endpoints.
 {
   "name": "Unified Search API",
   "version": "0.1.0",
-  "endpoints": { ... }
+  "docs": "/docs",
+  "endpoints": ["/v1/search", "/v1/crawl", "/v1/crawl/site", "/v1/extract", "/v1/map", "/v1/answer", "/v1/research", "/v1/jobs/{id}"]
 }
 ```
 
@@ -150,6 +312,80 @@ Liveness probe. Returns immediately; does not test upstream services.
 
 ---
 
+### GET /health/ready
+
+Readiness probe. Unlike `/health`, it actually tests the things a request needs:
+
+| Check | What it verifies |
+|---|---|
+| `searxng` | `GET {SEARXNG_URL}/healthz` answers within 2 s and is not a 5xx |
+| `crawler` | The crawler service exists. A browser pool that has not started yet counts as ready — it starts lazily on the first crawl, and launching one just to answer a probe would make every probe expensive |
+| `llm` | At least one provider API key for `LLM_MODEL`'s provider is present in the environment (litellm reads keys from the environment directly) |
+
+`/health` is unaffected by any of this and stays a pure liveness probe.
+
+**Auth required:** No (so an orchestrator can poll it without a key)
+
+**Response `200`** — every check passed:
+
+```json
+{
+  "status": "ready",
+  "version": "0.1.0",
+  "checks": {
+    "searxng": { "status": "ok", "detail": "reachable" },
+    "crawler": { "status": "ok", "detail": "browser pool not started yet (lazy)" },
+    "llm": { "status": "ok", "detail": "provider 'openai' key configured" }
+  }
+}
+```
+
+**Response `503`** — at least one check failed. `failed` lists the failing checks; the
+others still report, so one probe shows the whole picture:
+
+```json
+{
+  "status": "not_ready",
+  "version": "0.1.0",
+  "failed": ["searxng"],
+  "checks": {
+    "searxng": { "status": "error", "detail": "Could not reach SearXNG at http://searxng:8080: ..." },
+    "crawler": { "status": "ok", "detail": "browser pool started" },
+    "llm": { "status": "ok", "detail": "provider 'openai' key configured" }
+  }
+}
+```
+
+---
+
+### GET /metrics
+
+Prometheus exposition, in the standard text format
+(`Content-Type: text/plain; version=1.0.0`).
+
+**Auth required:** Yes — the payload includes `llm_cost_usd_total` and `llm_tokens_total`
+**labelled per API-key label**, i.e. what each of your clients spends. Scrape it with a dedicated
+key, or keep the route on an internal network at the reverse proxy. It is **exempt from rate
+limiting**: a scrape runs on its own schedule and must not draw down a caller's budget.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `http_request_duration_seconds` | histogram | `method`, `route`, `status_code` | Request latency. `route` is the *template* (`/v1/jobs/{job_id}`), never the raw path |
+| `http_requests_total` | counter | `method`, `route`, `status_code` | Requests served. Error rate is `rate(http_requests_total{status_code=~"5.."}[5m]) / rate(http_requests_total[5m])` |
+| `cache_requests_total` | counter | `cache` (`search`/`answer`/`rerank`), `outcome` (`hit`/`miss`) | Cache effectiveness. A search coalesced into an in-flight identical query counts as a hit |
+| `crawl_pages_total` | counter | `outcome` (`success`/`failure`) | Pages the crawler returned, blocked and failed ones included |
+| `crawler_browser_sessions_active` | gauge | — | Browser sessions holding a slot in the concurrency pool right now (ceiling: `CRAWL_MAX_CONCURRENCY`) |
+| `jobs_active` | gauge | `type` | Non-terminal background jobs, recomputed at scrape time |
+| `llm_tokens_total` | counter | `label`, `kind` (`prompt`/`completion`) | Tokens billed per API-key label |
+| `llm_cost_usd_total` | counter | `label` | Estimated spend per API-key label (same advisory figure as [Usage accounting](#usage-accounting)) |
+| `research_pages_skipped_by_rerank_total` | counter | — | Pages the pre-crawl reranker dropped, i.e. crawls and tokens not paid for |
+
+```bash
+curl -H "X-API-Key: $API_KEY" http://localhost:8000/metrics
+```
+
+---
+
 ### POST /v1/search
 
 Executes a web search via the bundled SearXNG instance and returns normalised results.
@@ -168,6 +404,12 @@ Executes a web search via the bundled SearXNG instance and returns normalised re
 | `time_range` | `"day"\|"week"\|"month"\|"year"` | No | `null` | Filter by publication date |
 | `safesearch` | `0\|1\|2` | No | `null` | Safe search level (0=off, 1=moderate, 2=strict) |
 | `max_results` | `integer` | No | `null` | Truncate to at most N results (1–100) |
+| `include_domains` | `string[]` | No | `null` | Keep only results on these domains (subdomains included) |
+| `exclude_domains` | `string[]` | No | `null` | Drop results on these domains (subdomains included) |
+
+Domain filters are applied **before** `max_results`, so asking for 5 results on one domain
+returns 5 of them rather than 5 minus whatever was filtered out. Host matching is the same
+as the network guard's: `example.com` also matches `www.example.com`.
 
 **Response `200`** — `SearchResponse`:
 
@@ -221,6 +463,42 @@ curl -X POST http://localhost:8000/v1/search \
 
 ---
 
+### GET /v1/search
+
+Same search, same response body, as a cacheable `GET`. Exists so the endpoint can be tried
+from a browser or curl, and — the real reason — so a reverse proxy or CDN in front of the API
+can serve repeats without touching this process.
+
+**Auth required:** When `AUTH_ENABLED=true`
+
+**Query parameters:** every [`SearchRequest`](#searchrequest) field. List-valued parameters
+(`categories`, `engines`, `include_domains`, `exclude_domains`) accept **either** repetition
+**or** a comma-separated value — both forms below are equivalent:
+
+```
+GET /v1/search?q=fastapi&categories=general&categories=news
+GET /v1/search?q=fastapi&categories=general,news
+```
+
+**Response headers:**
+
+| Header | Value | Notes |
+|---|---|---|
+| `Cache-Control` | `public, max-age=60` | `private, max-age=60` when `AUTH_ENABLED=true`: an authenticated response must never be handed to another key by a shared cache |
+| `ETag` | `"<sha256 prefix>"` | Hash of the response body |
+
+Send the `ETag` back as `If-None-Match` to get a `304 Not Modified` with an empty body.
+
+**Example:**
+
+```bash
+curl -i "http://localhost:8000/v1/search?q=FastAPI+tutorial&max_results=5&exclude_domains=pinterest.com"
+```
+
+`POST /v1/search` is unchanged and sets no cache headers.
+
+---
+
 ### POST /v1/crawl
 
 Crawls one or more URLs and returns their content as clean Markdown. Requests are executed concurrently, up to `CRAWL_MAX_CONCURRENCY` browser sessions shared across the whole process.
@@ -235,6 +513,7 @@ are refused. Results are returned in the order they were requested, one entry pe
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `urls` | `string[]` | Yes | — | URLs to crawl (1–50, must be valid HTTP/HTTPS URLs) |
+| `formats` | `string[]` | No | `["markdown"]` | Which artefacts to return: any of `markdown`, `html`, `screenshot`, `pdf`, `links`, `tables`. Only what is asked for is computed and returned |
 | `content_filter` | `"pruning"\|"none"` | No | `"pruning"` | Apply crawl4ai pruning filter for cleaner Markdown |
 | `prune_threshold` | `float` | No | `0.48` | Aggressiveness of pruning (0.0–1.0) |
 | `ignore_links` | `boolean` | No | `true` | Strip hyperlinks from Markdown output |
@@ -247,7 +526,7 @@ are refused. Results are returned in the order they were requested, one entry pe
 
 | Field | Type | Description |
 |---|---|---|
-| `count` | `integer` | Number of successfully crawled pages |
+| `count` | `integer` | Number of entries in `results`, i.e. one per input URL — failures included |
 | `results` | `CrawledPage[]` | One entry per input URL |
 
 **`CrawledPage`:**
@@ -261,9 +540,25 @@ are refused. Results are returned in the order they were requested, one entry pe
 | `markdown` | `string \| null` | Filtered Markdown content |
 | `raw_markdown` | `string \| null` | Unfiltered Markdown (only when `include_raw_markdown=true`) |
 | `word_count` | `integer` | Word count of the filtered Markdown |
-| `internal_links` | `string[]` | Internal links found on the page |
-| `external_links` | `string[]` | External links found on the page |
+| `internal_links` | `integer` | Number of internal links found on the page |
+| `external_links` | `integer` | Number of external links found on the page |
 | `error` | `string \| null` | Error message if `success=false` |
+| `html` | `string \| null` | Cleaned HTML — only with `"html"` in `formats` |
+| `screenshot` | `string \| null` | Base64 PNG — only with `"screenshot"` in `formats` |
+| `pdf` | `string \| null` | Base64 PDF render — only with `"pdf"` in `formats` |
+| `links` | `object \| null` | Full link map `{"internal": [...], "external": [...]}` — only with `"links"` in `formats` |
+| `tables` | `array \| null` | Tables extracted from the page — only with `"tables"` in `formats` |
+
+Fields not covered by the requested `formats` are `null`. The default (`["markdown"]`) returns
+exactly what v0.1 returned, so existing callers see no change.
+
+**PDF sources.** When `CRAWL_ENABLE_PDF=true` (the default), a URL that looks like a PDF
+(`.pdf` suffix, or a `/pdf/` path segment for arXiv-style links) is downloaded and text-extracted
+with `pypdf` instead of being rendered by the browser. The Markdown carries one `## Page n`
+section per page, and `"pdf"` in `formats` returns the original bytes base64-encoded. A URL that
+turns out not to serve `application/pdf` transparently falls back to the browser. PDFs over
+`CRAWL_PDF_MAX_MB` are reported as a per-URL failure, never as a crash. `/v1/answer` and
+`/v1/research` benefit automatically, since both crawl arbitrary search results.
 
 **Example:**
 
@@ -301,7 +596,9 @@ Launches an asynchronous deep-crawl of an entire website using BFS link-followin
 | Field | Type | Description |
 |---|---|---|
 | `job_id` | `string` | UUID to poll or stream |
+| `type` | `string` | Job type — `"site_crawl"` here |
 | `status` | `"pending"` | Initial job status |
+| `stream_url` | `string` | Ready-made path of the job's SSE stream |
 
 **Example:**
 
@@ -318,11 +615,132 @@ curl -X POST http://localhost:8000/v1/crawl/site \
 ```json
 {
   "job_id": "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5",
-  "status": "pending"
+  "type": "site_crawl",
+  "status": "pending",
+  "stream_url": "/v1/jobs/a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5/stream"
 }
 ```
 
-When the job completes, `result` in `/v1/jobs/{id}` contains the same structure as `CrawlResponse`.
+When the job completes, `result` in `/v1/jobs/{id}` is `{"base_url": ..., "count": ..., "pages": CrawledPage[]}`.
+
+---
+
+### POST /v1/extract
+
+Extracts structured data from a list of URLs. Two modes:
+
+| Mode | How | Cost |
+|---|---|---|
+| `css` | crawl4ai's `JsonCssExtractionStrategy` — deterministic CSS selectors | No LLM call |
+| `llm` | The page Markdown is handed to the model with a Pydantic schema built at request time from your JSON Schema | One model call per URL |
+
+URLs go through the same crawl path as `/v1/crawl`, so the same [network guard](#network-guard-ssrf),
+per-host politeness and global browser budget apply. A failure on one URL is reported on that URL
+only; the rest of the batch still returns.
+
+**Auth required:** When `AUTH_ENABLED=true`
+
+**Request body** (`application/json`):
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `urls` | `string[]` | Yes | — | URLs to extract from (1–25; capped lower than `/v1/crawl` because `llm` mode costs a model call each) |
+| `schema` | `object` | Yes | — | In `llm` mode a **JSON Schema** object; in `css` mode a **crawl4ai CSS schema** (`{"name", "baseSelector", "fields": [...]}`) |
+| `mode` | `"llm"\|"css"` | No | `"llm"` | Extraction strategy |
+| `model` | `string` | No | `null` | litellm model override (`llm` mode only) |
+
+The JSON-Schema mapping is reasonable-effort, not a full implementation: `string`, `number`,
+`integer`, `boolean`, arrays, nested objects and type unions are supported; anything else becomes
+an untyped field rather than being dropped. Fields outside `required` are optional, so a page
+missing one still yields the rest.
+
+**Response `200`** — `ExtractResponse`:
+
+| Field | Type | Description |
+|---|---|---|
+| `count` | `integer` | Number of entries (one per input URL) |
+| `results` | `ExtractResult[]` | One entry per input URL, in request order |
+
+**`ExtractResult`:** `url` (`string`), `data` (`object \| null`), `success` (`boolean`), `error` (`string \| null`).
+
+In `css` mode crawl4ai returns a *list* of records: a single record is returned as-is, several are
+wrapped as `{"items": [...]}`.
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8000/v1/extract \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": ["https://example.com/product/1"],
+    "mode": "llm",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string"},
+        "price": {"type": "number"}
+      },
+      "required": ["title"]
+    }
+  }'
+```
+
+```json
+{
+  "count": 1,
+  "results": [
+    { "url": "https://example.com/product/1", "data": { "title": "Widget", "price": 9.5 }, "success": true, "error": null }
+  ]
+}
+```
+
+**Errors:** `400` when every URL is refused by the network guard, `422` when the schema is unusable.
+
+---
+
+### POST /v1/map
+
+Discovers a site's URLs in about a second, without crawling it. Useful as a pre-step to
+`/v1/crawl/site`: map first, then crawl only what you want.
+
+Three sources are tried in order, and the first that yields URLs wins:
+
+1. `{origin}/sitemap.xml` — including one level of sitemap-index nesting (at most 10 nested sitemaps, to bound amplification)
+2. `Sitemap:` directives in `{origin}/robots.txt`
+3. the links of the entry page itself, crawled once
+
+The entry URL passes the [network guard](#network-guard-ssrf) before anything is fetched, and so
+does every document a sitemap or robots.txt points at.
+
+**Auth required:** When `AUTH_ENABLED=true`
+
+**Request body** (`application/json`):
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | `string` | Yes | — | Any URL on the site; its origin is the entry point |
+| `search` | `string` | No | `null` | Keep only URLs containing this substring (case-insensitive) |
+| `limit` | `integer` | No | `100` | Max URLs returned (1–1000) |
+
+**Response `200`** — `MapResponse`:
+
+| Field | Type | Description |
+|---|---|---|
+| `links` | `string[]` | Discovered URLs, deduplicated, filtered and truncated |
+| `count` | `integer` | Number of URLs returned |
+| `source` | `"sitemap"\|"robots"\|"page"` | Which source produced them |
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8000/v1/map \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com", "search": "pricing", "limit": 200}'
+```
+
+```json
+{ "links": ["https://example.com/pricing"], "count": 1, "source": "sitemap" }
+```
 
 ---
 
@@ -342,6 +760,19 @@ Answers a question in a single pipeline pass: search → optional full-page craw
 | `language` | `string` | No | `null` | Language hint passed to SearXNG |
 | `categories` | `string[]` | No | `null` | SearXNG categories to search in |
 | `fetch_full` | `boolean` | No | `true` | Crawl full page content; `false` uses snippets only (faster, less accurate) |
+| `stream` | `boolean` | No | `false` | Return `text/event-stream` instead of JSON — see below |
+
+**Streaming.** With `stream: true` the response is a Server-Sent Event stream of named events:
+`searching` (`{query}`), `crawling` (`{count}`), `generating` (`{}`), then one `token` event per
+generated token (`{token}`), and finally `done` carrying `{model, sources, usage}` — the same
+`sources` and `usage` the JSON response returns. A failure mid-stream arrives as an `error` event
+(`{detail}`) rather than an HTTP status, since the headers are already sent.
+
+**Caching.** Non-streaming answers are cached in-process for `ANSWER_CACHE_TTL` seconds, keyed by
+`query + model + max_sources + language`. A repeat within the window re-runs neither the search,
+the crawl, nor the model. Streaming answers (`stream=true`) are neither served from nor written to
+the cache: the point of streaming is the first token arriving early. Set `ANSWER_CACHE_ENABLED=false`
+to turn it off.
 
 **Response `200`** — `AnswerResponse`:
 
@@ -351,6 +782,7 @@ Answers a question in a single pipeline pass: search → optional full-page craw
 | `answer` | `string` | LLM-synthesised answer with `[1]`, `[2]` … inline citations |
 | `model` | `string` | LLM model that generated the answer |
 | `sources` | `Source[]` | Ordered list of consulted sources |
+| `usage` | `Usage` | Tokens, estimated cost, searches and pages for this call — see [Cost controls](#cost-controls). All zeros on a cache hit |
 
 **`Source`:**
 
@@ -416,6 +848,15 @@ Runs a multi-step deep-research pipeline: generates SERP queries, searches, craw
 | `interactive` | `boolean \| "auto"` | No | `"auto"` | Clarification behaviour: `false` = skip, `true` = always ask, `"auto"` = model decides |
 | `answers` | `string[]` | No | `null` | Answers to clarifying questions from a previous `needs_clarification` response; providing this triggers the actual research run |
 | `background` | `boolean` | No | `false` | Return immediately with a job ID instead of waiting for completion |
+| `stream` | `boolean` | No | `false` | Stream the final report token by token over the job's SSE channel. **Implies `background=true`** — `GET /v1/jobs/{id}/stream` is the only SSE channel |
+| `time_range` | `"day"\|"week"\|"month"\|"year"` | No | `null` | Restrict every SERP query of the run to this window (also feeds the reranker's freshness bonus) |
+| `include_domains` | `string[]` | No | `null` | Only research sources on these domains (subdomains included) |
+| `exclude_domains` | `string[]` | No | `null` | Never research sources on these domains (subdomains included) |
+| `estimate_only` | `boolean` | No | `false` | Return a projected cost and page count **without launching anything** — no search, no crawl, no model call. Answers with `status: "estimated"` |
+| `webhook_url` | `string` | No | `null` | Signed callback POSTed when a background job finishes — see [Webhooks](#webhooks). Requires `background`/`stream` and a configured `WEBHOOK_SECRET` |
+
+The filters apply at **every** recursion level, and domains are filtered before ranking and
+crawling — a filtered-out result never costs a crawl or a token.
 
 **Response — three possible shapes:**
 
@@ -432,6 +873,9 @@ Runs a multi-step deep-research pipeline: generates SERP queries, searches, craw
   ]
 }
 ```
+
+The clarification round-trip is itself a model call, so this response also carries a `usage` object,
+and what it spent is billed to the caller's daily budget.
 
 Re-submit with `answers` to proceed:
 
@@ -450,21 +894,53 @@ Re-submit with `answers` to proceed:
 | `status` | `"completed"` | Completion marker |
 | `query` | `string` | Original query |
 | `model` | `string` | LLM model used |
-| `report` | `string` | Full Markdown research report (typically 3+ pages) |
+| `report` | `string` | Full Markdown research report (typically 3+ pages) with inline `[n]` citations |
 | `learnings` | `string[]` | Key facts extracted during research |
 | `sources` | `string[]` | Deduplicated list of source URLs consulted |
+| `citations` | `{index, url}[]` | Numbered source map the report's `[n]` markers refer to |
 | `serp_queries` | `string[]` | All search queries generated during the run |
+| `usage` | `Usage` | What the run cost — see [Cost controls](#cost-controls) |
+| `stopped_early` | `boolean` | `true` when `RESEARCH_MAX_COST_USD` cut the exploration short. The report is still complete and self-describing; it just covers less ground |
 
 #### 3. `JobSubmitted` (when `background: true`)
 
 ```json
 {
   "job_id": "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5",
-  "status": "pending"
+  "type": "research",
+  "status": "pending",
+  "stream_url": "/v1/jobs/a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5/stream"
 }
 ```
 
-Track with `/v1/jobs/{id}`. The final `result` mirrors the `completed` shape above.
+Track with `/v1/jobs/{id}`, or pass a [`webhook_url`](#webhooks) to be told instead of polling. The final
+`result` mirrors the `completed` shape above, `usage` included.
+
+#### 4. `estimated` (when `estimate_only: true`)
+
+Prices the run from the request alone and returns before anything is launched.
+
+```json
+{
+  "status": "estimated",
+  "query": "quantum computing",
+  "model": "openai/gpt-4o-mini",
+  "estimate": {
+    "serp_queries": 12,
+    "searches": 12,
+    "pages_crawled": 36,
+    "llm_calls": 30,
+    "prompt_tokens": 117200,
+    "completion_tokens": 9700,
+    "estimated_cost_usd": 0.0234,
+    "model": "openai/gpt-4o-mini"
+  }
+}
+```
+
+The fanout (`serp_queries`, `pages_crawled`, `llm_calls`) is exact — it replays the engine's own
+recursion. The token and dollar figures are averages, so expect the cost to be right to within roughly a
+factor of two: enough to answer "cents or dollars?", which is the question it exists to answer.
 
 **Example — synchronous research:**
 
@@ -528,6 +1004,23 @@ curl http://localhost:8000/v1/jobs/a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5
 
 ---
 
+### DELETE /v1/jobs/{job\_id}
+
+Cancels a running job. Cancellation is requested, not awaited: the response returns immediately and
+the job settles as `failed` with `error: "cancelled"` once the task unwinds.
+
+**Auth required:** When `AUTH_ENABLED=true`
+
+**Response `202`:**
+
+```json
+{ "job_id": "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5", "status": "cancelling" }
+```
+
+**Response `404`** when `job_id` is unknown, **`409`** when the job already reached a terminal state.
+
+---
+
 ### GET /v1/jobs/{job\_id}/stream
 
 Streams real-time progress events for a job as [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events). Replays past events immediately for clients that connect after the job has started, then delivers new events as they arrive. The stream closes when the job reaches a terminal state.
@@ -548,10 +1041,10 @@ curl -N http://localhost:8000/v1/jobs/a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5/stream
 
 ```js
 const es = new EventSource('/v1/jobs/JOB_ID/stream');
-es.onmessage = (e) => {
-  const event = JSON.parse(e.data);
-  if (event.event === 'completed') es.close();
-};
+// Events are *named* (`event: progress`), so `onmessage` never fires — listen per name.
+es.addEventListener('progress', (e) => console.log(JSON.parse(e.data)));
+es.addEventListener('completed', () => es.close());
+es.addEventListener('failed', (e) => { console.error(JSON.parse(e.data).error); es.close(); });
 ```
 
 ---
@@ -569,7 +1062,9 @@ es.onmessage = (e) => {
   "pageno": 1,
   "time_range": "day" | "week" | "month" | "year" | null,
   "safesearch": 0 | 1 | 2 | null,
-  "max_results": null
+  "max_results": null,
+  "include_domains": ["string"] | null,
+  "exclude_domains": ["string"] | null
 }
 ```
 
@@ -578,6 +1073,7 @@ es.onmessage = (e) => {
 ```json
 {
   "urls": ["https://example.com"],
+  "formats": ["markdown"],
   "content_filter": "pruning",
   "prune_threshold": 0.48,
   "ignore_links": true,
@@ -601,6 +1097,27 @@ es.onmessage = (e) => {
 }
 ```
 
+### ExtractRequest
+
+```json
+{
+  "urls": ["https://example.com"],
+  "schema": { "type": "object", "properties": { "title": { "type": "string" } } },
+  "mode": "llm",
+  "model": null
+}
+```
+
+### MapRequest
+
+```json
+{
+  "url": "https://example.com",
+  "search": null,
+  "limit": 100
+}
+```
+
 ### AnswerRequest
 
 ```json
@@ -610,7 +1127,8 @@ es.onmessage = (e) => {
   "model": null,
   "language": null,
   "categories": null,
-  "fetch_full": true
+  "fetch_full": true,
+  "stream": false
 }
 ```
 
@@ -624,7 +1142,28 @@ es.onmessage = (e) => {
   "model": null,
   "interactive": "auto",
   "answers": null,
-  "background": false
+  "background": false,
+  "stream": false,
+  "time_range": null,
+  "include_domains": null,
+  "exclude_domains": null,
+  "estimate_only": false,
+  "webhook_url": null
+}
+```
+
+### Usage
+
+Returned by `/v1/answer` and `/v1/research`. See [Cost controls](#cost-controls).
+
+```json
+{
+  "prompt_tokens": 48210,
+  "completion_tokens": 3120,
+  "total_cost_usd": 0.021,
+  "searches": 12,
+  "pages_crawled": 27,
+  "pages_skipped_by_rerank": 43
 }
 ```
 
@@ -641,22 +1180,26 @@ All settings are environment variables (case-insensitive). Copy `.env.example` t
 | `APP_NAME` | `Unified Search API` | Name shown in API metadata |
 | `ENVIRONMENT` | `development` | Deployment environment label |
 | `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `LOG_FORMAT` | `json` | `json` for one structured object per line (see [Logging](#logging)), `text` for the plain one-liner |
+| `OTEL_ENABLED` | `false` | Enable OpenTelemetry tracing of FastAPI and httpx. The collector endpoint comes from the OTel SDK's own `OTEL_EXPORTER_OTLP_ENDPOINT` |
 
 ### Authentication
 
 | Variable | Default | Description |
 |---|---|---|
 | `AUTH_ENABLED` | `true` | Require API key on all `/v1/*` routes. Startup fails if `API_KEYS` is empty |
-| `API_KEYS` | `""` | Comma-separated list of valid API keys (`openssl rand -hex 32`) |
+| `API_KEYS` | `""` | Comma-separated list of valid API keys. Each entry is `label:key` or a bare `key` (`openssl rand -hex 32`) — see [Labeled keys](#labeled-keys) |
 
 ### Hardening
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATE_LIMIT_ENABLED` | `true` | Enable per-IP rate limiting |
-| `RATE_LIMIT_RPM` | `120` | Max requests per minute per IP |
+| `RATE_LIMIT_ENABLED` | `true` | Enable weighted rate limiting |
+| `RATE_LIMIT_RPM` | `120` | Points per 60s window per caller (keyed by API-key label, or by IP when auth is off) |
+| `RATE_LIMIT_RPM_OVERRIDES` | `""` | Per-label budgets, e.g. `app-mobile:500,test:20` |
 | `RATE_LIMIT_MAX_CLIENTS` | `10000` | Max distinct clients tracked (coldest evicted first) |
-| `SECURITY_HEADERS` | `true` | Add `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` headers |
+| `TRUSTED_PROXY` | `false` | Read the client IP from `X-Forwarded-For`. Enable **only** behind a proxy that sets it, or a caller can spoof the header and dodge the IP-keyed limiter |
+| `SECURITY_HEADERS` | `true` | Add `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` and a default `Cache-Control: no-store` |
 | `CORS_ORIGINS` | `*` | Comma-separated list of allowed CORS origins |
 
 ### Network guard (SSRF)
@@ -680,6 +1223,10 @@ as `success: false` with a `blocked: …` error.
 |---|---|---|
 | `SEARXNG_URL` | `http://searxng:8080` | SearXNG instance base URL |
 | `SEARXNG_TIMEOUT` | `15.0` | Request timeout in seconds |
+| `SEARXNG_MAX_CONNECTIONS` | `64` | Max pooled HTTP connections kept open to SearXNG |
+| `SEARCH_CACHE_ENABLED` | `true` | Memoize identical search queries in-process |
+| `SEARCH_CACHE_TTL` | `300` | Seconds an identical search result is reused |
+| `SEARCH_CACHE_MAX_SIZE` | `512` | Max distinct queries kept (LRU eviction) |
 
 ### LLM
 
@@ -689,6 +1236,12 @@ as `success: false` with a `blocked: …` error.
 | `LLM_REPORT_MODEL` | `""` | Optional dedicated model for research reports (falls back to `LLM_MODEL`) |
 | `LLM_TEMPERATURE` | `0.2` | Sampling temperature |
 | `LLM_MAX_TOKENS` | `4096` | Maximum output tokens |
+| `LLM_REPORT_MAX_TOKENS` | `8192` | Maximum output tokens for the final research report |
+| `LLM_FALLBACK_MODELS` | `""` | Comma-separated models tried in order when the primary keeps failing |
+| `LLM_TIMEOUT` | `120.0` | Max seconds for a single non-streaming LLM call |
+| `LLM_STREAM_TIMEOUT` | `30.0` | Max seconds a streaming call may stall before it is retried |
+| `LLM_MAX_RETRIES` | `3` | Retries per model before the next fallback model is tried |
+| `LLM_MAX_CONCURRENCY` | `10` | Process-wide cap on in-flight LLM calls |
 | `OPENAI_API_KEY` | — | OpenAI API key |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key |
 | `GEMINI_API_KEY` | — | Google Gemini API key |
@@ -703,12 +1256,31 @@ Any other provider API key recognised by [litellm](https://docs.litellm.ai/docs/
 | `CRAWL_MAX_CONCURRENCY` | `5` | Max concurrent browser sessions, **process-wide** (not per request) |
 | `CRAWL_TIMEOUT` | `30.0` | Per-page crawl timeout in seconds |
 | `CRAWL_PER_HOST_DELAY` | `1.0` | Min seconds between two hits on the same host; distinct hosts are never delayed |
+| `CRAWL_ENABLE_PDF` | `true` | Route PDF URLs through `pypdf` text extraction instead of the browser |
+| `CRAWL_PDF_MAX_MB` | `25` | Refuse PDFs larger than this (reported as a per-URL failure) |
+
+### URL discovery
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAP_TIMEOUT` | `5.0` | Max seconds per `sitemap.xml` / `robots.txt` fetch in `/v1/map` |
+
+### Answer cache
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANSWER_CACHE_ENABLED` | `true` | Reuse identical non-streaming `/v1/answer` responses |
+| `ANSWER_CACHE_TTL` | `600` | Seconds an entry is reused (`0` disables the cache) |
+| `ANSWER_CACHE_MAX_SIZE` | `256` | Max distinct answers kept (LRU eviction) |
 
 ### Jobs
 
 | Variable | Default | Description |
 |---|---|---|
-| `JOB_RETENTION_SECONDS` | `3600` | Seconds a finished job and its result are kept |
+| `JOB_BACKEND` | `sqlite` | `sqlite` persists jobs, results and progress events across a restart (needs the `./data` volume); `memory` keeps everything in-process and loses it on restart |
+| `JOB_DB_PATH` | `/srv/api/data/jobs.db` | SQLite file for `JOB_BACKEND=sqlite`. Its directory is created on first use |
+| `JOB_VACUUM_INTERVAL_SECONDS` | `86400` | How often the job database is `VACUUM`ed (`0` disables) |
+| `JOB_RETENTION_SECONDS` | `3600` | Seconds a finished job and its result are kept. Wall-clock, so it keeps counting across a restart |
 | `JOB_EVICT_INTERVAL_SECONDS` | `300` | Sweep interval for aged-out jobs (`0` disables) |
 | `JOB_MAX_PROGRESS_EVENTS` | `500` | Progress events retained per job (oldest dropped) |
 | `JOB_SUBSCRIBER_QUEUE_SIZE` | `1000` | Buffered events per SSE subscriber; a slow client loses the oldest |
@@ -720,13 +1292,40 @@ Any other provider API key recognised by [litellm](https://docs.litellm.ai/docs/
 | `RESEARCH_DEFAULT_BREADTH` | `4` | Default SERP queries per recursion level |
 | `RESEARCH_DEFAULT_DEPTH` | `2` | Default recursion depth |
 | `RESEARCH_CONCURRENCY` | `2` | Parallel query workers, **for the whole run** (not per recursion level) |
+| `RESEARCH_SYNC_TIMEOUT` | `600.0` | Max wall-clock seconds for a synchronous run before a `504` (`0` = no limit). Use `background: true` for long queries |
 | `RESEARCH_REPORT_TOKEN_BUDGET` | `12000` | Token budget for the learnings fed to the final-report prompt |
+| `RESEARCH_RESULTS_PER_QUERY` | `10` | SERP results requested per query (titles/snippets are free) |
+| `RESEARCH_CRAWL_TOP_K` | `3` | Reranked results per query that are actually crawled |
+| `RESEARCH_RERANK` | `llm` | Pre-crawl relevance filter: `off`, `lexical`, or `llm` |
+| `RESEARCH_RERANK_MODEL` | `""` | Model used by the LLM reranker (falls back to `LLM_MODEL`) |
+| `RESEARCH_RERANK_CACHE_TTL` | `600` | Seconds a rerank decision is reused across overlapping SERPs (`0` disables) |
+| `RESEARCH_PER_PAGE_TOKEN_BUDGET` | `2000` | Max tokens kept from a single crawled page |
+| `RESEARCH_PROCESS_CONTEXT_TOKEN_BUDGET` | `8000` | Token budget for the pages fed to one extraction call |
+| `RESEARCH_MAX_COST_USD` | `0` | Per-run cost ceiling; the run stops exploring and writes its report (`0` disables) |
+| `RESEARCH_NUM_LEARNINGS` | `3` | Max learnings extracted per SERP query |
+| `RESEARCH_NUM_FOLLOWUPS` | `3` | Max follow-up questions extracted per SERP query |
+
+### Cost controls
+
+| Variable | Default | Description |
+|---|---|---|
+| `DAILY_COST_CAP_USD` | `0` | Max USD per API-key label per UTC day across `/v1/research` and `/v1/answer` (`0` disables). Durable with `JOB_BACKEND=sqlite`; resets on restart with `JOB_BACKEND=memory` |
+| `RESEARCH_MAX_COST_USD` | `0` | Per-run ceiling — see the Research table above |
+
+### Webhooks
+
+| Variable | Default | Description |
+|---|---|---|
+| `WEBHOOK_SECRET` | `""` | HMAC-SHA256 key for `X-Webhook-Signature` (`openssl rand -hex 32`). While empty, requests carrying a `webhook_url` are refused with a `400` |
+| `WEBHOOK_TIMEOUT` | `10.0` | Max seconds for the callback POST. A failing webhook never fails the job |
 
 ---
 
 ## SSE streaming format
 
-The `/v1/jobs/{id}/stream` endpoint uses Server-Sent Events. Each event is a JSON object delivered as `data: <json>\n\n`.
+The `/v1/jobs/{id}/stream` endpoint uses Server-Sent Events. Each event is delivered as a named
+event whose payload is a JSON object — `event: <name>\ndata: <json>\n\n` — and the name is repeated
+inside the JSON as `event`, so a client can dispatch on either.
 
 ### Event types
 
@@ -748,11 +1347,9 @@ Emitted throughout the job with context-specific fields.
 {
   "event": "progress",
   "stage": "searching",
-  "current_depth": 1,
-  "total_depth": 2,
-  "completed_queries": 3,
-  "total_queries": 8,
-  "message": "searching: quantum error correction"
+  "depth": "1/2",
+  "queries": "3/8",
+  "message": "quantum error correction"
 }
 ```
 
@@ -760,21 +1357,30 @@ Emitted throughout the job with context-specific fields.
 {
   "event": "progress",
   "stage": "processed",
-  "current_depth": 1,
-  "total_depth": 2,
-  "completed_queries": 4,
-  "total_queries": 8,
-  "message": "processed: quantum error correction"
+  "depth": "1/2",
+  "queries": "4/8",
+  "message": "quantum error correction"
 }
 ```
+
+With `stream: true` on `/v1/research`, the final report also arrives token by token on the same
+channel. Token events reuse the `progress` envelope and are discriminated by `stage`:
+
+```json
+{ "event": "progress", "stage": "report_token", "token": "## Findings" }
+```
+
+Concatenating every `report_token` in order reproduces the report body; the full report (with its
+numbered source appendix) is still available from `GET /v1/jobs/{id}` once the job completes.
 
 **For site crawl jobs:**
 
 ```json
 {
   "event": "progress",
-  "pages_crawled": 12,
-  "message": "crawled: https://docs.example.com/guide"
+  "stage": "crawled",
+  "pages": 12,
+  "url": "https://docs.example.com/guide"
 }
 ```
 
@@ -805,13 +1411,21 @@ Internal sentinel that closes the stream. Clients can safely ignore this or use 
 ### Full SSE stream example
 
 ```
+event: status
 data: {"event": "status", "status": "running"}
 
-data: {"event": "progress", "stage": "searching", "current_depth": 1, "total_depth": 2, "completed_queries": 0, "total_queries": 4, "message": "searching: AI coding tools 2025"}
+event: progress
+data: {"event": "progress", "stage": "searching", "depth": "1/2", "queries": "0/4", "message": "AI coding tools 2025"}
 
-data: {"event": "progress", "stage": "processed", "current_depth": 1, "total_depth": 2, "completed_queries": 1, "total_queries": 4, "message": "processed: AI coding tools 2025"}
+event: progress
+data: {"event": "progress", "stage": "processed", "depth": "1/2", "queries": "1/4", "message": "AI coding tools 2025"}
 
+event: progress
+data: {"event": "progress", "stage": "report_token", "token": "# AI coding tools"}
+
+event: completed
 data: {"event": "completed"}
 
+event: __end__
 data: {"event": "__end__"}
 ```

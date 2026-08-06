@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 
+import anyio
 import pytest
 from fastapi import FastAPI
 from sse_starlette.sse import EventSourceResponse
@@ -85,7 +86,9 @@ def test_real_app_sse_endpoint_is_not_compressed() -> None:
     from app.main import app
 
     mgr = JobManager()
-    job = mgr.create("demo")
+    # `create` is async (it writes through to the job store); this test drives a
+    # blocking TestClient, so the coroutine is run on its own loop first.
+    job = anyio.run(mgr.create, "demo")
     # Terminal before the client subscribes, so the stream replays and closes
     # instead of blocking the test on a live job.
     job.progress.append({"event": "completed", "job_id": job.id})

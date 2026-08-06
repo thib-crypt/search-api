@@ -18,7 +18,18 @@ dist/
 .ruff_cache/
 .pytest_cache/
 .coverage
+coverage.xml
 htmlcov/
+
+# Build artifacts of the OpenAPI tooling (scripts/generate-client.sh,
+# scripts/export-openapi.py). Generated clients are regenerated from the schema,
+# never reviewed by hand and never committed.
+clients/
+openapi.json
+.openapi-generator-cli/
+
+# Load test output
+loadtest/results/
 
 # crawl4ai / playwright cache
 .crawl4ai/

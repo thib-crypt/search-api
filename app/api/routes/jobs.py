@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
@@ -23,7 +25,7 @@ async def get_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> JobView:
 
 
 @router.delete("/{job_id}", status_code=202, summary="Cancel a running job")
-async def cancel_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> dict:
+async def cancel_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> dict[str, str]:
     if jobs.get(job_id) is None:
         raise HTTPException(status_code=404, detail="Job not found.")
     if not jobs.cancel(job_id):
@@ -36,7 +38,7 @@ async def stream_job(job_id: str, jobs: JobManager = Depends(get_jobs)) -> Event
     if jobs.get(job_id) is None:
         raise HTTPException(status_code=404, detail="Job not found.")
 
-    async def event_source():
+    async def event_source() -> AsyncIterator[dict[str, Any]]:
         async for event in jobs.stream(job_id):
             yield {"event": event.get("event", "progress"), "data": json.dumps(event)}
 

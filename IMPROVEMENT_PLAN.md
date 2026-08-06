@@ -682,28 +682,35 @@ chaque page ; `CRAWL_PER_HOST_DELAY` ne temporise plus que les collisions de dom
 - l'app refuse de démarrer avec `AUTH_ENABLED=true` et `API_KEYS=` vide
 - une requête sans clé sur `/v1/research` renvoie 401
 
-### Phase 8 — Performance du chemin chaud (P1) · ~2 j
-- [ ] Middlewares ASGI purs (§3.1)
-- [ ] GZip + ORJSON (§3.2, §3.3)
-- [ ] tiktoken non bloquant (§3.4)
-- [ ] Single-flight sur le cache de recherche (§3.5)
-- [ ] Retry/timeout/fallback LLM via `litellm.Router` (§4.1)
+### Phase 8 — Performance du chemin chaud (P1) · ~2 j — ✅ **livrée**
+- [x] Middlewares ASGI purs (§3.1)
+- [x] GZip + ORJSON (§3.2, §3.3) — ORJSON appliqué route par route (`/v1/answer`
+      uniquement) plutôt qu'en `default_response_class` : sur FastAPI ≥0.136 le
+      défaut app-wide désactive le fast-path Pydantic→bytes de toutes les autres
+      routes (constat fait pendant l'implémentation, contraire à l'hypothèse du plan)
+- [x] tiktoken non bloquant (§3.4)
+- [x] Single-flight sur le cache de recherche (§3.5)
+- [x] Retry/timeout/fallback LLM via `litellm.Router` (§4.1)
 
 **Critère d'acceptation** : benchmark avant/après sur `/v1/search` et `/v1/crawl` (p50, p95),
 chiffres consignés dans le PR.
 
 ### Phase 9 — Qualité & coût de la recherche (P1) · ~3 j
-- [ ] Dédup d'URL par run + normalisation (§4.2a)
-- [ ] Interface `Reranker` + `NoopReranker` + `LexicalReranker` BM25 (§4.2b)
-- [ ] `LLMReranker` avec bascule automatique sur lexical en cas d'échec (§4.2b)
-- [ ] SERP élargi (`RESULTS_PER_QUERY=10`) + `CRAWL_TOP_K=3` (§4.2b)
-- [ ] Mémoïsation des décisions de rerank (§4.2b)
-- [ ] Dédup de contenu inter-sources (§4.2c)
-- [ ] Rapport en texte libre + `LLM_REPORT_MAX_TOKENS` (§2.11)
-- [ ] Citations en ligne dans le rapport (§5.5)
+- [x] Dédup d'URL par run + normalisation (§4.2a)
+- [x] Interface `Reranker` + `NoopReranker` + `LexicalReranker` BM25 (§4.2b)
+- [x] `LLMReranker` avec bascule automatique sur lexical en cas d'échec (§4.2b)
+- [x] SERP élargi (`RESULTS_PER_QUERY=10`) + `CRAWL_TOP_K=3` (§4.2b)
+- [x] Mémoïsation des décisions de rerank (§4.2b)
+- [x] Dédup de contenu inter-sources (§4.2c)
+- [x] Rapport en texte libre + `LLM_REPORT_MAX_TOKENS` (§2.11)
+- [x] Citations en ligne dans le rapport (§5.5)
 - [x] ~~Délai de crawl conditionné au domaine (§4.3)~~ — livré en Phase 7
-- [ ] Fusion clarification/génération de queries (§4.4)
-- [ ] Refactor `AnswerService` (§4.5), constantes en config (§4.6)
+- [x] Fusion clarification/génération de queries (§4.4) — retenu : heuristique de
+      spécificité en mode `auto` (pas d'appel LLM quand la requête est déjà précise),
+      plutôt que l'appel structuré fusionné, pour garder la forme de la route intacte
+- [x] Refactor `AnswerService` (§4.5), constantes en config (§4.6)
+- [ ] Comparaison chiffrée `off|lexical|llm` sur le jeu de référence (voir critère
+      d'acceptation ci-dessous) — bloquée par la comptabilité de coût (§6.5)
 
 **Critère d'acceptation** : sur un jeu de 10 requêtes de référence, comparer les trois modes
 `RESEARCH_RERANK=off|lexical|llm` sur trois axes — pages crawlées, coût USD, latence — à qualité
@@ -713,38 +720,147 @@ de rapport égale ou supérieure. Les chiffres décident du défaut à livrer.
 > Livrer §6.5 seul en amont (c'est petit) plutôt que d'estimer à l'aveugle.
 
 ### Phase 10 — Nouveaux endpoints (P2) · ~3 j
-- [ ] `POST /v1/extract` (§5.1)
-- [ ] `POST /v1/map` (§5.2)
-- [ ] Formats de sortie de crawl (§5.3)
-- [ ] Ingestion PDF (§5.4)
-- [ ] Streaming + filtres de recherche (§5.6)
-- [ ] Cache `/v1/answer` (§5.7)
-- [ ] `GET /health/ready` (§5.9), `GET /v1/search` (§5.10)
+- [x] `POST /v1/extract` (§5.1) — modes `css` (JsonCssExtractionStrategy) et `llm` (modèle
+      Pydantic construit à la volée depuis le JSON Schema). Échec par URL, jamais par lot.
+- [x] `POST /v1/map` (§5.2) — sitemap.xml (1 niveau d'index, max 10 sitemaps imbriqués) →
+      robots.txt → liens de la page d'entrée. Garde SSRF sur chaque document récupéré.
+- [x] Formats de sortie de crawl (§5.3) — `formats: [markdown, html, screenshot, pdf, links,
+      tables]`. *Non retenus* : `ssl_certificate` et `response_headers` (hors de la liste du
+      correctif §5.3, aucun usage aval aujourd'hui) ; `markdown_with_citations` /
+      `references_markdown` (les citations du rapport sont déjà couvertes par §5.5, livré en
+      Phase 9).
+- [x] Ingestion PDF (§5.4) — `pypdf`, extraction en thread (boucle unique), `CRAWL_ENABLE_PDF`,
+      `CRAWL_PDF_MAX_MB`. Détection par suffixe `.pdf` / segment `/pdf/` puis vérification du
+      `Content-Type`, sans HEAD systématique sur chaque URL crawlée.
+- [x] Streaming + filtres de recherche (§5.6) — `stream=true` (implique le mode job, tokens
+      émis en `stage: "report_token"` sur le flux SSE existant), `time_range`,
+      `include_domains` / `exclude_domains` sur `/v1/research` **et** `/v1/search`.
+- [x] Cache `/v1/answer` (§5.7) — `TTLCache` partagé, clé `query+model+max_sources+language`,
+      copie profonde en lecture. Le chemin streaming n'est ni lu ni écrit.
+- [x] `GET /health/ready` (§5.9), `GET /v1/search` (§5.10) — readiness = ping SearXNG + état du
+      pool navigateur + présence d'une clé provider ; GET search avec `Cache-Control` + `ETag`
+      (`private` dès que l'auth est active) et `304` sur `If-None-Match`.
 
-### Phase 11 — Persistance & protection de la facture (P2) · ~2 j
+### Phase 11 — Persistance & protection de la facture (P2) · ~2 j — ✅ **livrée**
 > Remplace l'ancienne phase « scale-out ». Redis retiré du périmètre (§0).
 
-- [ ] Comptabilité tokens/coût par run et par clé (§6.5) — *à avancer avant la Phase 9*
-- [ ] Job store SQLite + volume Docker (§6.1)
-- [ ] Clés API labellisées (§6.2)
-- [ ] Rate limiting pondéré par coût d'endpoint (§6.3)
-- [ ] Disjoncteurs : plafond par run, plafond journalier, `estimate_only` (§6.4)
-- [ ] Webhooks de fin de job (§5.8)
+- [x] Comptabilité tokens/coût par run et par clé (§6.5) — `app/core/llm/usage.py`,
+      exposée dans `ResearchResponse.usage` / `AnswerResponse.usage` et agrégée par label
+- [x] Job store SQLite + volume Docker (§6.1) — `app/jobs/store.py` (miroir write-through
+      derrière le dict en mémoire), volume `./data:/srv/api/data`
+- [x] Clés API labellisées (§6.2) — format `label:clé`, rétrocompatible, label auto dérivé
+      d'un SHA-256 tronqué (jamais réversible vers la clé)
+- [x] Rate limiting pondéré par coût d'endpoint (§6.3) — bucket par label (IP sans auth),
+      headers `RateLimit-*`, surcharges par label
+- [x] Disjoncteurs : plafond par run, plafond journalier, `estimate_only` (§6.4)
+- [x] Webhooks de fin de job (§5.8) — HMAC-SHA256, cible passée par `UrlGuard`
 
 **Critères d'acceptation** : un redémarrage du conteneur préserve un rapport terminé ; une clé
 qui atteint son plafond journalier reçoit un 429 explicite pendant qu'une autre continue de
-fonctionner.
+fonctionner. ✅ Couverts par `tests/test_job_store.py` et `tests/test_cost_control.py`.
 
-### Phase 12 — Observabilité (P2) · ~1–2 j
-- [ ] Logs JSON avec `request_id` et label de clé (§7.1)
-- [ ] `/metrics` Prometheus, protégé (§7.2)
-- [ ] OpenTelemetry optionnel (§7.3)
+**Écarts assumés** :
+- Le `JobStore` est un **miroir de durabilité**, pas le chemin de lecture : `JobManager.get()`
+  reste synchrone (mono-process, SSE sur le chemin chaud) et le dict est réhydraté au démarrage
+  via `load_all()`. Seuls `create()` et `start()` deviennent `async`.
+- `/health/ready` est **exempté** du rate limiting plutôt que pondéré à 1 : une sonde
+  d'orchestrateur ne doit pas consommer le budget d'un client.
+- Un `webhook_url` sans `WEBHOOK_SECRET` est **refusé** (400) plutôt qu'envoyé non signé.
+- Le compteur journalier en mode `memory` est volatile — documenté comme limitation connue
+  dans `app/core/cost.py` et dans `.env.example`.
 
-### Phase 13 — DX & industrialisation · ~1–2 j
-- [ ] mypy strict + couverture en CI (§8)
-- [ ] Tests de charge et benchmarks de régression (§8)
-- [ ] Exemples OpenAPI, SDK généré (§8)
-- [ ] `API_REFERENCE.md` régénéré, README à jour
+### Phase 12 — Observabilité (P2) · ~1–2 j — ✅ **livrée**
+- [x] Logs JSON avec `request_id` (§7.1) — `app/core/logging.py` : formatter JSON stdlib
+      (aucune dépendance de logging externe), `contextvars.ContextVar` posée par
+      `RequestContextMiddleware` et lue par un `logging.Filter` sur le handler racine, donc
+      **tout** appel `logger.*` du call tree d'une requête porte son `request_id`, pas seulement
+      la ligne d'accès. Une ligne d'accès par requête (méthode, path, status, `duration_ms`),
+      chronométrée autour de l'appel ASGI complet — donc une réponse SSE est mesurée sur la durée
+      de son flux, pas de ses en-têtes. `LOG_FORMAT=json|text`, `json` par défaut.
+- [x] `/metrics` Prometheus, protégé (§7.2) — `app/core/metrics.py` (singletons de module, seul
+      fichier qui importe `prometheus_client`), `app/api/routes/metrics.py` derrière
+      `require_api_key` et exempté du rate limiting. Latence + comptage par route (**gabarit**
+      `/v1/jobs/{job_id}`, jamais le path brut), hit/miss des trois caches, issues de crawl,
+      sessions navigateur actives, jobs en cours, tokens et coût **par label de clé**, pages
+      écartées par le rerank.
+- [x] OpenTelemetry optionnel (§7.3) — `app/core/tracing.py`, `OTEL_ENABLED=false` par défaut,
+      instrumentation FastAPI + httpx, exporteur OTLP configuré par les variables d'environnement
+      du SDK OTel.
+
+**Critères d'acceptation** : une requête qui échoue se retrouve intégralement dans les logs à
+partir du seul `X-Request-ID` rendu au client ; `rate(http_requests_total{status_code=~"5.."}[5m])`
+donne le taux d'erreur sans métrique dédiée. ✅ Couverts par `tests/test_observability.py`.
+
+**Écarts assumés** :
+- **Aucun mécanisme de gate dédié pour `/metrics`** : la clé API, comme partout ailleurs. Le plan
+  proposait « auth **ou** réseau interne » ; l'opérateur qui veut un scrape anonyme restreint au
+  niveau du reverse-proxy plutôt que d'ajouter une seconde porte dans l'application.
+- Le compteur `cache_requests_total{cache="search"}` compte comme **hit** une recherche fusionnée
+  dans un vol identique déjà en cours (single-flight, §3.4) : comme un hit, elle ne coûte aucun
+  aller-retour SearXNG, et hits + miss restent égaux au nombre de recherches demandées.
+- `crawler_browser_sessions_active` ne compte que les sessions **navigateur** : le téléchargement
+  d'un PDF prend un jeton du même sémaphore mais n'ouvre pas d'onglet.
+- litellm n'est **pas** instrumenté par ses propres callbacks OTel : ses appels providers passent
+  par httpx, déjà tracé, et la partie que httpx ne voit pas (tokens, coût) est déjà rapportée par
+  l'`UsageTracker` de §6.5.
+
+### Phase 13 — DX & industrialisation · ~1–2 j — ✅ **livrée**
+- [x] mypy strict + couverture en CI (§8) — `[tool.mypy] strict = true` sur `app`
+  (override `ignore_missing_imports` pour `crawl4ai.*` : ni stubs ni marqueur
+  `py.typed` publiés, rien à corriger de notre côté). Les 59 erreurs remontées ont
+  été corrigées, pas supprimées : un seul `type: ignore` subsiste, sur le
+  `create_model` dynamique de `app/services/extract.py` (un modèle construit à
+  partir d'un JSON Schema fourni à l'exécution n'a pas de type statique).
+  `pytest-cov` avec `fail_under = 80` dans `[tool.coverage.report]` ; la
+  couverture réelle est de **91,9 %**, le seuil sert donc de garde-fou contre une
+  régression franche. CI : lint → format → types → tests, du moins cher au plus cher.
+- [x] Tests de charge et benchmarks de régression (§8) — **deux outils distincts,
+  volontairement** : `loadtest/locustfile.py` (locust, extra `loadtest`) vise
+  `/v1/search` et `/v1/answer` sur un déploiement **réel** et n'est pas branché en
+  CI — aucun runner GitHub n'a de SearXNG, de navigateur ni de fournisseur LLM ;
+  `scripts/bench.py` mesure en **in-process** (TestClient + dépendances simulées)
+  le surcoût propre de l'application (routage, middlewares, sérialisation) et
+  tourne en CI en **étape informative** (`continue-on-error`), la latence sur un
+  runner partagé étant trop bruitée pour servir de seuil bloquant.
+- [x] Exemples OpenAPI, SDK généré (§8) — `json_schema_extra.examples` sur les 7
+  modèles de requête, vérifiés contre le schéma généré. Le SDK est livré comme
+  **outillage**, pas comme client committé : `scripts/export-openapi.py` (schéma
+  sans serveur, via `app.openapi()`) + `scripts/generate-client.sh`
+  (openapi-generator via `npx`), sortie dans `clients/` qui est gitignoré — un
+  client généré est un artefact de build, pas du code à relire. Génération
+  `typescript-fetch` vérifiée de bout en bout.
+- [x] `API_REFERENCE.md` régénéré, README à jour — passe de cohérence contre les
+  sources (`config.py`, routes, modèles) : formes des réponses de job, événements
+  SSE, endpoints manquants (`GET /v1/search`, `/v1/extract`, `/v1/map`,
+  `DELETE /v1/jobs/{id}`) et une dizaine de clés de configuration non documentées.
+- [x] Dependabot (§8) — `.github/dependabot.yml` : écosystèmes `pip` (qui couvre
+  `pyproject.toml` + `uv.lock`), `github-actions` et `docker`, hebdomadaire.
+
+**Corrections hors périmètre, remontées ici parce qu'elles touchent l'exécution.**
+Deux bugs réels trouvés en écrivant les tests manquants de §8, corrigés :
+- `app/core/llm/tokens.py` — la pré-troncature caractère supposait un plafond dur
+  de 6 caractères/token. C'est faux : BPE fusionne les longues suites d'un même
+  caractère, donc espaces, filets `---` et indentation profonde atteignent 16 à
+  128 caractères/token. `trim_to_tokens(" " * 60000, 1000)` rendait **48** tokens
+  au lieu de 1000 — le modèle recevait 5 % du contexte autorisé, silencieusement,
+  sur exactement le genre de markdown que le crawler produit. La tranche est
+  maintenant vérifiée et agrandie tant qu'elle ne dépasse pas le budget.
+- `app/core/crawl/crawler.py` — le re-contrôle SSRF de `_collect` était inopérant.
+  `_guard_landing` court-circuite quand `landed == requested`, ce qui est correct
+  pour `crawl()` (l'URL demandée a été vérifiée avant le fetch) mais pas pour les
+  pages qu'un crawl profond découvre lui-même : `requested` y était lu **sur le
+  résultat**, donc toujours égal à `landed`, et la garde ne s'exécutait jamais.
+  Un site public pointant vers `169.254.169.254` voyait son contenu renvoyé au
+  client. Corrigé par `requested_was_checked=False` depuis `_collect`.
+
+Tests ajoutés là où l'audit a trouvé de vrais trous (SSRF du crawl de site, arrêt
+du `JobManager` avec un job en vol, fan-out multi-abonnés, plafond de concurrence
+LLM qui n'avait aucun test, budgets de tokens à faible densité). Le reste de la
+liste « tests manquants » de §8 était **déjà couvert** par les phases 7–12 :
+`tests/test_ssrf.py`, `tests/test_crawler_service.py`, `tests/test_jobs.py` +
+`tests/test_job_bounds.py`, `tests/test_cache.py`. Note pour §8 : le single-flight
+est dans `app/core/search/searxng.py`, pas dans `app/core/cache.py` qui n'est
+qu'un TTL+LRU sans coalescence.
 
 ---
 

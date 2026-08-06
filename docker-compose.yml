@@ -5,6 +5,11 @@ services:
       - "${API_PORT:-8000}:8000"
     env_file:
       - .env
+    volumes:
+      # §6.1: the SQLite job database and the per-key cost ledger. Without this
+      # a restart loses every finished report (and hands every key a fresh daily
+      # budget). Must match JOB_DB_PATH's directory.
+      - ./data:/srv/api/data
     environment:
       # Override so the API reaches SearXNG via the compose network.
       SEARXNG_URL: http://searxng:8080

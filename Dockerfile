@@ -39,6 +39,11 @@ RUN playwright install chromium && chmod -R a+rX /ms-playwright
 COPY --chmod=755 app ./app
 RUN uv pip install --system --no-cache --no-deps .
 
+# Job database + cost ledger (§6.1). Created and chowned while still root so the
+# path exists and is writable even when no volume is mounted over it; a bind
+# mount from the host replaces it, which is what docker-compose does.
+RUN mkdir -p /srv/api/data && chown -R appuser /srv/api/data
+
 # Back to the base image's unprivileged user for runtime.
 USER appuser
 

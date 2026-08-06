@@ -1,7 +1,8 @@
 import pytest
 from starlette.testclient import TestClient
 
-from app.api.deps import get_crawler, get_jobs, get_llm, get_searxng
+from app.api.deps import get_crawler, get_jobs, get_llm, get_reranker, get_searxng
+from app.core.research.rerank import NoopReranker
 from app.jobs.manager import JobManager, JobStatus
 from app.main import app
 from app.models.crawl import CrawledPage
@@ -11,7 +12,7 @@ from tests.test_research import FakeCrawler, FakeLLM, FakeSearxng
 @pytest.mark.asyncio
 async def test_job_runs_and_records_result() -> None:
     mgr = JobManager()
-    job = mgr.create("demo")
+    job = await mgr.create("demo")
 
     async def task(emit) -> dict:
         await emit({"stage": "a"})
@@ -30,7 +31,7 @@ async def test_job_runs_and_records_result() -> None:
 @pytest.mark.asyncio
 async def test_job_records_failure() -> None:
     mgr = JobManager()
-    job = mgr.create("demo")
+    job = await mgr.create("demo")
 
     async def task(emit) -> dict:
         raise ValueError("boom")
@@ -50,20 +51,20 @@ async def test_finished_jobs_are_evicted_after_retention() -> None:
     async def task(emit) -> dict:
         return {}
 
-    first = mgr.create("demo")
+    first = await mgr.create("demo")
     mgr.submit(first, task)
     await mgr._tasks[first.id]
     assert first.status is JobStatus.completed
 
     # Creating another job triggers eviction of the now-stale finished one.
-    mgr.create("demo")
+    await mgr.create("demo")
     assert mgr.get(first.id) is None
 
 
 @pytest.mark.asyncio
 async def test_stream_replays_progress_after_completion() -> None:
     mgr = JobManager()
-    job = mgr.create("demo")
+    job = await mgr.create("demo")
 
     async def task(emit) -> dict:
         await emit({"stage": "only"})
@@ -88,6 +89,7 @@ def _override_research(jobs: JobManager):
     app.dependency_overrides[get_searxng] = lambda: FakeSearxng()
     app.dependency_overrides[get_crawler] = lambda: FakeCrawler()
     app.dependency_overrides[get_llm] = lambda: FakeLLM(feedback_questions=[])
+    app.dependency_overrides[get_reranker] = lambda: NoopReranker()
     app.dependency_overrides[get_jobs] = lambda: jobs
 
 
@@ -150,7 +152,7 @@ async def test_cancel_running_job_returns_202() -> None:
         await asyncio.sleep(60)
         return {}
 
-    job = mgr.create("demo")
+    job = await mgr.create("demo")
     mgr.submit(job, long_task)
     await started.wait()  # ensure the coroutine is actually running before cancelling
 
@@ -168,7 +170,7 @@ async def test_cancel_terminal_job_returns_false() -> None:
     async def task(emit) -> dict:
         return {}
 
-    job = mgr.create("demo")
+    job = await mgr.create("demo")
     mgr.submit(job, task)
     await mgr._tasks[job.id]
 

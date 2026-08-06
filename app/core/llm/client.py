@@ -29,6 +29,8 @@ from litellm.types.router import (
 )
 from pydantic import BaseModel
 
+from app.core.llm.usage import UsageTracker, record
+
 # Drop params a given provider doesn't support instead of erroring (e.g. some
 # models reject `temperature`).
 litellm.drop_params = True
@@ -132,6 +134,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        usage: UsageTracker | None = None,
     ) -> str:
         async with _concurrency_guard(self.max_concurrency):
             resp = await self._acompletion(
@@ -140,6 +143,7 @@ class LLMClient:
                 temperature=self.temperature if temperature is None else temperature,
                 max_tokens=max_tokens or self.max_tokens,
             )
+        record(usage, resp)
         return (resp.choices[0].message.content or "").strip()
 
     async def stream_complete(
@@ -149,21 +153,41 @@ class LLMClient:
         model: str | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        usage: UsageTracker | None = None,
     ) -> AsyncIterator[str]:
         # The guard is held for the whole stream: the provider connection stays
         # open until the last chunk, so the slot is genuinely in use until then.
         async with _concurrency_guard(self.max_concurrency):
+            kwargs: dict[str, Any] = {}
+            if usage is not None:
+                # Most providers only report token usage on a stream when asked.
+                # `litellm.drop_params` removes it for the ones that reject it,
+                # and a provider that simply ignores it costs us the accounting
+                # for this call, not the call itself.
+                kwargs["stream_options"] = {"include_usage": True}
             resp = await self._acompletion(
                 model=model or self.default_model,
                 messages=messages,
                 temperature=self.temperature if temperature is None else temperature,
                 max_tokens=max_tokens or self.max_tokens,
                 stream=True,
+                **kwargs,
             )
+            # The usage-bearing chunk is normally the last one and carries no
+            # delta. Only a reference is kept, so accounting does not make the
+            # process retain a whole report's worth of chunks.
+            final_chunk: Any = None
             async for chunk in resp:
-                delta = chunk.choices[0].delta.content
+                if usage is not None and getattr(chunk, "usage", None):
+                    final_chunk = chunk
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = choices[0].delta.content
                 if delta:
                     yield delta
+            if final_chunk is not None:
+                record(usage, final_chunk)
 
     async def structured(
         self,
@@ -174,9 +198,23 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         max_retries: int = 2,
+        usage: UsageTracker | None = None,
     ) -> T:
         async with _concurrency_guard(self.max_concurrency):
-            return await self._aclient.create(
+            if usage is None:
+                # instructor's async client is untyped; it returns `response_model`.
+                created: T = await self._aclient.create(
+                    model=model or self.default_model,
+                    messages=messages,
+                    response_model=response_model,
+                    temperature=self.temperature if temperature is None else temperature,
+                    max_tokens=max_tokens or self.max_tokens,
+                    max_retries=max_retries,
+                )
+                return created
+            # Instructor hands back only the parsed model unless asked for the
+            # raw completion too — which is where the token counts live.
+            pair: tuple[T, Any] = await self._aclient.create_with_completion(
                 model=model or self.default_model,
                 messages=messages,
                 response_model=response_model,
@@ -184,3 +222,6 @@ class LLMClient:
                 max_tokens=max_tokens or self.max_tokens,
                 max_retries=max_retries,
             )
+            parsed, completion = pair
+        record(usage, completion)
+        return parsed

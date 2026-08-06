@@ -2,8 +2,13 @@
 
 Long-running work (deep research, whole-site crawls) runs as a background
 ``asyncio.Task``. Progress events are appended to the job and fanned out to any
-live SSE subscribers. The storage is in-memory behind a small surface, so it can
-be swapped for Redis later without touching the routes.
+live SSE subscribers.
+
+Live jobs are held in a plain dict, which is the read path: one worker, one
+process, so `get()` stays synchronous and allocation-free. Durability (§6.1) is
+a **write-through mirror** onto a `JobStore` — SQLite in production, a no-op in
+tests — hydrated back into the dict at startup. A store that fails is logged and
+ignored; see `app.jobs.store` for why.
 """
 
 from __future__ import annotations
@@ -13,17 +18,22 @@ import contextlib
 import logging
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:  # avoids a cycle: the store imports Job/JobStatus from here
+    from app.jobs.store import JobStore
 
 logger = logging.getLogger("unified_search_api.jobs")
 
 Emit = Callable[[dict[str, Any]], Awaitable[None]]
 JobTask = Callable[[Emit], Awaitable[dict[str, Any]]]
+# Every subscriber queue and every published event carries the same payload shape.
+EventQueue = asyncio.Queue[dict[str, Any]]
 
 # Pushed onto subscriber queues to signal end-of-stream.
 _SENTINEL: dict[str, Any] = {"event": "__end__"}
@@ -39,7 +49,18 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _offer(queue: asyncio.Queue, event: dict[str, Any]) -> None:
+def _age_seconds(timestamp: str) -> float:
+    """Seconds since an ISO timestamp, clamped at 0. Unparseable reads as brand new."""
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return max((datetime.now(UTC) - parsed).total_seconds(), 0.0)
+
+
+def _offer(queue: EventQueue, event: dict[str, Any]) -> None:
     """Enqueue ``event``, dropping the oldest entries if the subscriber is behind.
 
     An unbounded queue lets one slow SSE reader pin the memory of a whole crawl.
@@ -104,10 +125,12 @@ class JobManager:
         evict_interval_seconds: float = 300.0,
         max_progress_events: int = _DEFAULT_MAX_PROGRESS,
         subscriber_queue_size: int = _DEFAULT_QUEUE_SIZE,
+        store: JobStore | None = None,
+        vacuum_interval_seconds: float = 0.0,
     ) -> None:
         self._jobs: dict[str, Job] = {}
-        self._subscribers: dict[str, set[asyncio.Queue]] = {}
-        self._tasks: dict[str, asyncio.Task] = {}
+        self._subscribers: dict[str, set[EventQueue]] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
         # Without eviction, finished jobs (and their results) would pin memory for
         # the process lifetime. Terminal jobs are dropped once they age past this.
         self._retention = retention_seconds
@@ -115,18 +138,70 @@ class JobManager:
         self._max_progress = max(max_progress_events, 1)
         self._queue_size = max(subscriber_queue_size, 1)
         self._evict_interval = evict_interval_seconds
-        self._evictor: asyncio.Task | None = None
+        self._evictor: asyncio.Task[None] | None = None
+        # Defaults to the no-op store so a bare `JobManager()` — which is what
+        # every test builds — never touches a disk. Production passes a real one.
+        if store is None:
+            from app.jobs.store import InMemoryJobStore
+
+            store = InMemoryJobStore()
+        self._store = store
+        self._vacuum_interval = vacuum_interval_seconds
+        self._last_vacuum = time.monotonic()
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
-    def start(self) -> None:
-        """Start the periodic sweeper.
+    def active_counts(self) -> dict[str, int]:
+        """Non-terminal jobs per type, recomputed on demand (§7.2).
+
+        Sampled by `GET /metrics` rather than maintained as a counter through
+        every state transition: the table is small and a derived count cannot
+        drift out of sync with reality, whereas a hand-maintained one can.
+        """
+        counts: dict[str, int] = {}
+        for job in self._jobs.values():
+            if not job.terminal:
+                counts[job.type] = counts.get(job.type, 0) + 1
+        return counts
+
+    async def _persist(self, awaitable: Awaitable[Any], what: str) -> None:
+        """Await a store operation, swallowing its failures.
+
+        The store is a durability mirror, not the source of truth (see
+        `app.jobs.store`): a full disk, a locked database or a store
+        implementation that raises must cost the deployment its restart-survival,
+        never the job it is in the middle of running.
+        """
+        try:
+            await awaitable
+        except Exception:  # noqa: BLE001 - degraded durability beats a failed job
+            logger.exception("Job store could not %s", what)
+
+    async def start(self) -> None:
+        """Open the store, hydrate whatever survived, and start the sweeper.
 
         Eviction used to happen only when a new job was created, so an instance
         that went quiet kept every finished report — up to 500 pages of markdown
         each — for as long as the process lived.
         """
+        await self._persist(self._store.start(), "start")
+        try:
+            restored = await self._store.load_all(self._max_progress)
+        except Exception:  # noqa: BLE001 - an unreadable mirror starts empty
+            logger.exception("Job store could not be read; starting with no jobs")
+            restored = []
+        for job in restored:
+            self._jobs[job.id] = job
+            self._subscribers.setdefault(job.id, set())
+            if job.terminal:
+                # Retention is wall-clock, so a job that finished long before the
+                # restart is already stale and must not get a fresh hour of life.
+                self._finished_at[job.id] = time.monotonic() - _age_seconds(job.updated_at)
+        if self._jobs:
+            logger.info("Restored %d job(s) from the job store", len(self._jobs))
+        await self._evict()
+
         if self._evict_interval > 0 and self._evictor is None:
             self._evictor = asyncio.create_task(self._evict_loop())
 
@@ -134,7 +209,11 @@ class JobManager:
         while True:
             await asyncio.sleep(self._evict_interval)
             try:
-                self._evict()
+                await self._evict()
+                now = time.monotonic()
+                if self._vacuum_interval > 0 and now - self._last_vacuum >= self._vacuum_interval:
+                    self._last_vacuum = now
+                    await self._persist(self._store.maintain(), "run its periodic maintenance")
             except Exception:  # noqa: BLE001 - the sweeper must never die
                 logger.exception("Job eviction sweep failed")
 
@@ -151,15 +230,17 @@ class JobManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._persist(self._store.close(), "close")
 
-    def create(self, job_type: str) -> Job:
-        self._evict()
+    async def create(self, job_type: str) -> Job:
+        await self._evict()
         job = Job(id=uuid4().hex, type=job_type, progress=deque(maxlen=self._max_progress))
         self._jobs[job.id] = job
         self._subscribers[job.id] = set()
+        await self._persist(self._store.create(job), "persist a new job")
         return job
 
-    def _evict(self) -> None:
+    async def _evict(self) -> None:
         """Drop terminal jobs that have aged past the retention window."""
         if not self._finished_at:
             return
@@ -170,6 +251,8 @@ class JobManager:
             self._subscribers.pop(jid, None)
             self._tasks.pop(jid, None)
             self._finished_at.pop(jid, None)
+        if stale:
+            await self._persist(self._store.delete(stale), "evict aged-out jobs")
 
     def cancel(self, job_id: str) -> bool:
         """Cancel an in-flight job. Returns False if the job is unknown or already terminal."""
@@ -212,18 +295,24 @@ class JobManager:
         job.updated_at = _now()
         job.progress.append(event)
         self._fanout(job.id, event)
+        # Persisted after the fanout: a live subscriber must never wait on a disk
+        # write for its next progress event.
+        await self._persist(
+            self._store.append_event(job.id, event, self._max_progress), "persist a progress event"
+        )
+        await self._persist(self._store.update(job), "persist a job update")
 
     def _fanout(self, job_id: str, event: dict[str, Any]) -> None:
         for queue in list(self._subscribers.get(job_id, ())):
             _offer(queue, event)
 
-    async def stream(self, job_id: str):
+    async def stream(self, job_id: str) -> AsyncIterator[dict[str, Any]]:
         """Yield events for a job: a replay of progress so far, then live updates."""
         job = self._jobs.get(job_id)
         if job is None:
             return
 
-        queue: asyncio.Queue = asyncio.Queue(maxsize=self._queue_size)
+        queue: EventQueue = asyncio.Queue(maxsize=self._queue_size)
         subscribers = self._subscribers.setdefault(job_id, set())
         subscribers.add(queue)
         try:

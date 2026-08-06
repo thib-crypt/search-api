@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -15,28 +16,43 @@ from app.api.middleware import (
     RateLimitMiddleware,
     RequestContextMiddleware,
 )
-from app.api.routes import answer, crawl, health, jobs, research, search
+from app.api.routes import answer, crawl, extract, health, jobs, metrics, research, search
+from app.api.routes import map as map_routes  # aliased: `map` shadows the builtin
 from app.config import get_settings
+from app.core.cache import TTLCache
+from app.core.cost import build_cost_ledger
 from app.core.crawl.crawler import CrawlerService
 from app.core.llm.client import LLMClient
+from app.core.logging import configure_logging
 from app.core.net.guard import UrlGuard
+from app.core.research.rerank import build_reranker
 from app.core.search.searxng import SearxngClient
+from app.core.tracing import setup_tracing
 from app.jobs.manager import JobManager
+from app.jobs.store import build_job_store
 
 logger = logging.getLogger("unified_search_api")
 
 settings = get_settings()
-logging.basicConfig(level=settings.log_level)
+# §7.1: JSON on one line per record by default, with the request id stamped on
+# every record emitted while a request is in flight. LOG_FORMAT=text restores the
+# previous human-readable format for a local run.
+configure_logging(settings.log_level, settings.log_format)
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Read the settings again at startup rather than reusing the import-time copy,
     # so the running app reflects the environment it was actually started in.
     settings = get_settings()
     # Refuse to serve a configuration that would leave the API (and the provider
     # bill behind it) open. Raising here aborts startup.
     settings.validate_startup()
+    # Re-read here too: the import-time call above used the import-time settings.
+    configure_logging(settings.log_level, settings.log_format)
+    # §7.3: opt-in, best-effort. Never aborts startup.
+    if settings.otel_enabled:
+        setup_tracing(app, service_name=settings.app_name)
     if not settings.auth_enabled and settings.environment != "development":
         logger.warning(
             "AUTH_ENABLED is false in environment=%s: every caller can spend your "
@@ -60,6 +76,8 @@ async def lifespan(app: FastAPI):
         timeout=settings.crawl_timeout,
         guard=app.state.url_guard,
         per_host_delay=settings.crawl_per_host_delay,
+        enable_pdf=settings.crawl_enable_pdf,
+        pdf_max_mb=settings.crawl_pdf_max_mb,
     )
     app.state.llm = LLMClient(
         default_model=settings.llm_model,
@@ -71,18 +89,41 @@ async def lifespan(app: FastAPI):
         max_retries=settings.llm_max_retries,
         max_concurrency=settings.llm_max_concurrency,
     )
+    # §5.7: shared by every request; `AnswerService` itself is built per request.
+    app.state.answer_cache = (
+        TTLCache(ttl=settings.answer_cache_ttl, max_size=settings.answer_cache_max_size)
+        if settings.answer_cache_enabled and settings.answer_cache_ttl > 0
+        else None
+    )
+    # Chosen once from config: the engine only ever sees the protocol.
+    app.state.reranker = build_reranker(
+        settings.research_rerank,
+        llm=app.state.llm,
+        model=settings.research_rerank_model,
+        cache_ttl=settings.research_rerank_cache_ttl,
+    )
+    # §6.4b: the per-key daily spend counters. Durable alongside the jobs when
+    # JOB_BACKEND=sqlite, process-local (and reset on restart) otherwise.
+    app.state.cost_ledger = build_cost_ledger(settings.job_backend, settings.job_db_path)
+    await app.state.cost_ledger.start()
     app.state.jobs = JobManager(
         retention_seconds=settings.job_retention_seconds,
         evict_interval_seconds=settings.job_evict_interval_seconds,
         max_progress_events=settings.job_max_progress_events,
         subscriber_queue_size=settings.job_subscriber_queue_size,
+        # §6.1: finished reports survive a restart instead of 404ing.
+        store=build_job_store(settings.job_backend, settings.job_db_path),
+        vacuum_interval_seconds=settings.job_vacuum_interval_seconds,
     )
-    app.state.jobs.start()
+    await app.state.jobs.start()
     try:
         yield
     finally:
         # Cancel in-flight jobs before tearing down the clients they depend on.
         await app.state.jobs.shutdown()
+        close_ledger = getattr(app.state.cost_ledger, "close", None)
+        if close_ledger is not None:
+            await close_ledger()
         await app.state.searxng.aclose()
         await app.state.crawler.close()
 
@@ -144,6 +185,8 @@ async def root() -> dict[str, object]:
             "/v1/search",
             "/v1/crawl",
             "/v1/crawl/site",
+            "/v1/extract",
+            "/v1/map",
             "/v1/answer",
             "/v1/research",
             "/v1/jobs/{id}",
@@ -152,8 +195,11 @@ async def root() -> dict[str, object]:
 
 
 app.include_router(health.router)
+app.include_router(metrics.router)
 app.include_router(search.router)
 app.include_router(crawl.router)
+app.include_router(extract.router)
+app.include_router(map_routes.router)
 app.include_router(answer.router)
 app.include_router(research.router)
 app.include_router(jobs.router)

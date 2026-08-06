@@ -16,6 +16,9 @@ os.environ.setdefault("ENVIRONMENT", "development")
 os.environ["AUTH_ENABLED"] = "false"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
 os.environ["API_KEYS"] = ""
+# §6.1 defaults to a SQLite file under /srv/api/data; the suite must never touch
+# a disk. Tests that exercise the sqlite store build one against a tmp_path.
+os.environ["JOB_BACKEND"] = "memory"
 # Deterministic crawling in tests: no politeness sleep, and no DNS lookups for
 # the fake hosts the fixtures use. The SSRF tests opt back into the real guard.
 os.environ["CRAWL_PER_HOST_DELAY"] = "0"

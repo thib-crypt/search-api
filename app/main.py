@@ -10,7 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api.middleware import RateLimitMiddleware, RequestContextMiddleware
+from app.api.middleware import (
+    CompressionMiddleware,
+    RateLimitMiddleware,
+    RequestContextMiddleware,
+)
 from app.api.routes import answer, crawl, health, jobs, research, search
 from app.config import get_settings
 from app.core.crawl.crawler import CrawlerService
@@ -61,6 +65,11 @@ async def lifespan(app: FastAPI):
         default_model=settings.llm_model,
         temperature=settings.llm_temperature,
         max_tokens=settings.llm_max_tokens,
+        fallback_models=settings.llm_fallback_model_list,
+        timeout=settings.llm_timeout,
+        stream_timeout=settings.llm_stream_timeout,
+        max_retries=settings.llm_max_retries,
+        max_concurrency=settings.llm_max_concurrency,
     )
     app.state.jobs = JobManager(
         retention_seconds=settings.job_retention_seconds,
@@ -86,10 +95,24 @@ app = FastAPI(
         "and LLM deep-research reports."
     ),
     lifespan=lifespan,
+    # NOTE (§3.3): deliberately no `default_response_class=ORJSONResponse` here.
+    # On FastAPI >= 0.136 a route serializes straight to JSON bytes via Pydantic's
+    # Rust core only when its response class is still the framework default
+    # (`use_dump_json = response_field is not None and isinstance(response_class,
+    # DefaultPlaceholder)` in fastapi/routing.py). Setting the app-wide default to
+    # ORJSONResponse makes it a non-placeholder and silently turns that fast path
+    # off for *every* route that declares a response model or a return annotation
+    # -- crawl, search, research, jobs, health -- replacing it with the slower
+    # "validate -> Python dict -> orjson.dumps" path. orjson is therefore applied
+    # per-route, only where the fast path is unavailable: see /v1/answer, whose
+    # union with EventSourceResponse forces response_model=None.
 )
 
-# Middleware runs in reverse registration order, so the rate limiter (added last)
-# executes first, then the request-context/security-headers layer, then CORS.
+# Middleware runs in reverse registration order, so compression (added last)
+# executes first, then the rate limiter, then the request-context/security-headers
+# layer, then CORS. Compression sits outermost on purpose: it is the last layer to
+# touch the response on the way out, so it compresses the final body after CORS and
+# the security headers have been added. It leaves text/event-stream untouched.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -98,6 +121,7 @@ app.add_middleware(
 )
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(CompressionMiddleware, minimum_size=1024)
 
 
 @app.exception_handler(Exception)

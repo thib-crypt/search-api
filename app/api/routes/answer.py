@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import ORJSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from app.api.deps import get_crawler, get_llm, get_searxng, require_api_key
@@ -18,6 +19,13 @@ router = APIRouter(prefix="/v1", tags=["answer"], dependencies=[Depends(require_
 @router.post(
     "/answer",
     response_model=None,
+    # The union with EventSourceResponse forces response_model=None, which rules out
+    # FastAPI's serialize-straight-to-bytes fast path, so this is the one route where
+    # orjson is a real win over the stdlib encoder (§3.3). Applied per-route rather
+    # than app-wide: an app-wide default would disable the fast path everywhere else.
+    # Only the non-streaming branch uses it -- returning EventSourceResponse directly
+    # bypasses response_class entirely.
+    response_class=ORJSONResponse,
     summary="Sourced answer (search + crawl + LLM). Set stream=true for Server-Sent Events.",
 )
 async def answer(

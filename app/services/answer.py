@@ -89,7 +89,7 @@ class AnswerService:
                 s.used_full_text = True
             else:
                 body = s.snippet
-            body = trim_to_tokens(body, per_source_budget)
+            body = await trim_to_tokens(body, per_source_budget)
             blocks.append(f"[{s.index}] {s.title}\nURL: {s.url}\n{body}")
 
         context = "\n\n---\n\n".join(blocks) if blocks else "(no sources found)"
@@ -142,7 +142,7 @@ class AnswerService:
                 s.used_full_text = True
             else:
                 body = s.snippet
-            body = trim_to_tokens(body, per_source_budget)
+            body = await trim_to_tokens(body, per_source_budget)
             blocks.append(f"[{s.index}] {s.title}\nURL: {s.url}\n{body}")
 
         context = "\n\n---\n\n".join(blocks) if blocks else "(no sources found)"

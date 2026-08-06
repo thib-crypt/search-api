@@ -1,20 +1,29 @@
-"""HTTP hardening middleware: request IDs, security headers, rate limiting.
+"""HTTP hardening middleware: request IDs, security headers, rate limiting, compression.
 
 All middleware read settings dynamically per request so behavior can be toggled
 via the environment without re-importing the app.
+
+These classes are pure ASGI3 middleware rather than ``BaseHTTPMiddleware``
+subclasses: the latter wraps every request in an anyio task group plus a memory
+object stream, which costs on the critical path of a single-worker deployment
+and breaks backpressure on the SSE endpoints (``GET /v1/jobs/{id}/stream`` and
+the streaming branch of ``POST /v1/answer``).
 """
 
 from __future__ import annotations
 
 import time
 from collections import OrderedDict, deque
+from collections.abc import MutableMapping
+from typing import Any
 from uuid import uuid4
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.datastructures import MutableHeaders
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.config import get_settings
+
+Scope = MutableMapping[str, Any]
 
 # Paths that should never be rate limited.
 _EXEMPT_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
@@ -49,41 +58,75 @@ def _purge(now: float, max_clients: int) -> None:
         _HITS.popitem(last=False)
 
 
-class RequestContextMiddleware(BaseHTTPMiddleware):
+def _header(scope: Scope, name: str) -> str | None:
+    """Case-insensitive lookup of a request header from the raw ASGI scope."""
+    wanted = name.lower().encode("latin-1")
+    for key, value in scope["headers"]:
+        if key.lower() == wanted:
+            return value.decode("latin-1")
+    return None
+
+
+class RequestContextMiddleware:
     """Attach a request id and (optionally) security headers to every response."""
 
-    async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or uuid4().hex
-        request.state.request_id = request_id
+    def __init__(self, app) -> None:
+        self.app = app
 
-        response: Response = await call_next(request)
+    async def __call__(self, scope: Scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
-        response.headers["X-Request-ID"] = request_id
-        if get_settings().security_headers:
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            response.headers["Referrer-Policy"] = "no-referrer"
-            response.headers.setdefault("Cache-Control", "no-store")
-        return response
+        request_id = _header(scope, "x-request-id") or uuid4().hex
+        # Starlette's Request.state reads and writes through scope["state"], so
+        # downstream handlers still see request.state.request_id.
+        scope.setdefault("state", {})["request_id"] = request_id
+
+        async def send_wrapper(message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Request-ID"] = request_id
+                if get_settings().security_headers:
+                    headers["X-Content-Type-Options"] = "nosniff"
+                    headers["X-Frame-Options"] = "DENY"
+                    headers["Referrer-Policy"] = "no-referrer"
+                    headers.setdefault("Cache-Control", "no-store")
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
+# Byte-for-byte identical to what JSONResponse would have produced.
+_RATE_LIMIT_BODY = b'{"detail":"Rate limit exceeded."}'
+
+
+class RateLimitMiddleware:
     """Simple per-IP sliding-window limiter, enabled via RATE_LIMIT_ENABLED."""
 
-    async def dispatch(self, request: Request, call_next):
-        settings = get_settings()
-        if not settings.rate_limit_enabled or request.url.path in _EXEMPT_PATHS:
-            return await call_next(request)
+    def __init__(self, app) -> None:
+        self.app = app
 
+    async def __call__(self, scope: Scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        settings = get_settings()
+        if not settings.rate_limit_enabled or scope["path"] in _EXEMPT_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        client = scope.get("client")
         if settings.trusted_proxy:
-            forwarded_for = request.headers.get("x-forwarded-for")
+            forwarded_for = _header(scope, "x-forwarded-for")
             client_ip = (
                 forwarded_for.split(",")[0].strip()
                 if forwarded_for
-                else (request.client.host if request.client else "unknown")
+                else (client[0] if client else "unknown")
             )
         else:
-            client_ip = request.client.host if request.client else "unknown"
+            client_ip = client[0] if client else "unknown"
         now = time.monotonic()
         _purge(now, settings.rate_limit_max_clients)
         hits = _HITS.get(client_ip)
@@ -96,11 +139,71 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(hits) >= settings.rate_limit_rpm:
             retry_after = int(_WINDOW - (now - hits[0])) + 1
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded."},
-                headers={"Retry-After": str(retry_after)},
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 429,
+                    "headers": [
+                        (b"retry-after", str(retry_after).encode("latin-1")),
+                        (b"content-length", str(len(_RATE_LIMIT_BODY)).encode("latin-1")),
+                        (b"content-type", b"application/json"),
+                    ],
+                }
             )
+            await send({"type": "http.response.body", "body": _RATE_LIMIT_BODY})
+            return
 
         hits.append(now)
-        return await call_next(request)
+        await self.app(scope, receive, send)
+
+
+def _is_event_stream(headers) -> bool:
+    """True when raw ASGI response headers announce ``text/event-stream``."""
+    for key, value in headers:
+        if key.lower() == b"content-type":
+            return value.lower().lstrip().startswith(b"text/event-stream")
+    return False
+
+
+class CompressionMiddleware:
+    """GZip large JSON/markdown payloads, never Server-Sent Events.
+
+    Crawl responses of many pages and research reports are worth compressing;
+    SSE is not. Starlette's ``GZipMiddleware`` buffers the body it encodes,
+    which would destroy incremental delivery and backpressure on the streaming
+    endpoints. Path-based exclusion is not enough: ``POST /v1/answer`` picks SSE
+    from the *request body* (``stream=true``), so the decision has to be made on
+    the outgoing ``Content-Type``.
+
+    The first ``http.response.start`` is inspected; if it announces
+    ``text/event-stream``, that message and every one after it bypasses the gzip
+    responder and goes straight to the server untouched. Everything else is
+    handed to a stock ``GZipMiddleware`` so the compression itself (streaming
+    chunks, ``Content-Length``/``Vary`` bookkeeping) stays Starlette's code.
+    """
+
+    def __init__(self, app, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+
+    async def __call__(self, scope: Scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def inner(inner_scope: Scope, inner_receive, gzip_send) -> None:
+            # `gzip_send` belongs to GZipMiddleware's responder; `send` is the
+            # raw server send. SSE responses are routed around the responder.
+            passthrough = False
+
+            async def send_wrapper(message) -> None:
+                nonlocal passthrough
+                if message["type"] == "http.response.start":
+                    passthrough = _is_event_stream(message.get("headers", ()))
+                await (send if passthrough else gzip_send)(message)
+
+            await self.app(inner_scope, inner_receive, send_wrapper)
+
+        # One GZipMiddleware per request: it only holds config, and its responder
+        # allocates a fresh gzip buffer per request anyway.
+        await GZipMiddleware(inner, minimum_size=self.minimum_size)(scope, receive, send)

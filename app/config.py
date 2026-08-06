@@ -86,6 +86,34 @@ class Settings(BaseSettings):
     llm_report_model: str = Field(default="")
     llm_temperature: float = Field(default=0.2)
     llm_max_tokens: int = Field(default=4096)
+    llm_report_max_tokens: int = Field(
+        default=8192,
+        description=(
+            "Max output tokens for the final research report. Separate from "
+            "LLM_MAX_TOKENS, which would cap a multi-page report at ~3000 words."
+        ),
+    )
+    llm_fallback_models: str = Field(
+        default="",
+        description=(
+            "Comma-separated litellm model strings tried in order if the primary model fails."
+        ),
+    )
+    llm_timeout: float = Field(
+        default=120.0, description="Max seconds for a single non-streaming LLM call."
+    )
+    llm_stream_timeout: float = Field(
+        default=30.0, description="Max seconds a streaming LLM call may stall before it is retried."
+    )
+    llm_max_retries: int = Field(
+        default=3, description="Retries per model before the next fallback model is tried."
+    )
+    llm_max_concurrency: int = Field(
+        default=10,
+        description=(
+            "Process-wide cap on in-flight LLM calls, to avoid saturating the provider quota."
+        ),
+    )
     # Provider keys are read by litellm directly from the environment
     # (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, ...).
 
@@ -141,6 +169,10 @@ class Settings(BaseSettings):
     @property
     def report_model(self) -> str:
         return self.llm_report_model or self.llm_model
+
+    @property
+    def llm_fallback_model_list(self) -> list[str]:
+        return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
 
     @property
     def crawl_allowed_port_set(self) -> frozenset[int]:

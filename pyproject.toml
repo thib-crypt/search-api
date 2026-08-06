@@ -20,6 +20,7 @@ dependencies = [
     "tiktoken>=0.8",
     "python-multipart>=0.0.12",
     "sse-starlette>=2.1",
+    "orjson>=3.10",
 ]
 
 [project.optional-dependencies]

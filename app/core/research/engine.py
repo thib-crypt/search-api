@@ -83,7 +83,7 @@ class _RunState:
     total: int = 0
 
 
-def _fit_learnings(learnings: list[str], budget: int) -> list[str]:
+async def _fit_learnings(learnings: list[str], budget: int) -> list[str]:
     """Keep as many learnings as fit in ``budget`` tokens, earliest first.
 
     A `breadth=8, depth=3` run accumulates enough learnings to blow past the
@@ -96,10 +96,10 @@ def _fit_learnings(learnings: list[str], budget: int) -> list[str]:
     kept: list[str] = []
     used = 0
     for learning in learnings:
-        cost = count_tokens(learning) + 2  # + list formatting
+        cost = await count_tokens(learning) + 2  # + list formatting
         if used + cost > budget:
             if not kept:  # a single oversized learning still has to fit
-                kept.append(trim_to_tokens(learning, budget))
+                kept.append(await trim_to_tokens(learning, budget))
             break
         kept.append(learning)
         used += cost
@@ -264,7 +264,7 @@ class DeepResearchEngine:
         for page in pages:
             if page.success and page.markdown:
                 visited.append(page.url)
-                contents.append(trim_to_tokens(page.markdown, PER_PAGE_TOKEN_BUDGET))
+                contents.append(await trim_to_tokens(page.markdown, PER_PAGE_TOKEN_BUDGET))
         return visited, contents
 
     async def _process_contents(
@@ -273,7 +273,7 @@ class DeepResearchEngine:
         if not contents:
             return SerpProcessing()
         budget = max(PROCESS_CONTEXT_TOKEN_BUDGET // len(contents), 200)
-        trimmed = [trim_to_tokens(c, budget) for c in contents]
+        trimmed = [await trim_to_tokens(c, budget) for c in contents]
         return await self._llm.structured(
             messages=self._messages(
                 prompts.process_result_prompt(query, trimmed, NUM_LEARNINGS, NUM_FOLLOWUPS)
@@ -285,7 +285,7 @@ class DeepResearchEngine:
     async def _write_report(
         self, query: str, learnings: list[str], sources: list[str], model: str | None
     ) -> str:
-        kept = _fit_learnings(learnings, self._report_token_budget)
+        kept = await _fit_learnings(learnings, self._report_token_budget)
         draft = await self._llm.structured(
             messages=self._messages(prompts.final_report_prompt(query, kept)),
             response_model=ReportDraft,

@@ -8,16 +8,35 @@ API is its only client.
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import urlencode
+from typing import Any
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 
+from app.core import metrics
 from app.core.cache import TTLCache
+from app.core.net.guard import host_matches
 from app.models.search import SearchRequest, SearchResponse, SearchResultItem
 
 
 class SearxngError(RuntimeError):
     """Raised when the SearXNG backend cannot be reached or returns an error."""
+
+
+def _domain_allowed(url: str, include: set[str], exclude: set[str]) -> bool:
+    """Apply the include/exclude domain filters (§5.6) to one result URL.
+
+    Host matching is shared with the SSRF guard, so "example.com" covers
+    "www.example.com" here exactly as it does in the allow/deny lists.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if not host:
+        return False
+    if exclude and host_matches(host, exclude):
+        return False
+    if include and not host_matches(host, include):
+        return False
+    return True
 
 
 def _mark_exception_retrieved(fut: asyncio.Future[SearchResponse]) -> None:
@@ -66,6 +85,20 @@ class SearxngClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    async def ping(self, probe_timeout: float = 2.0) -> None:
+        """Cheap reachability probe for `/health/ready` (§5.9).
+
+        Deliberately not a search: readiness must not cost a real SERP round-trip
+        on every probe. Any answer from the process counts as reachable — only a
+        transport failure or a 5xx means "not ready".
+        """
+        try:
+            resp = await self._client.get("/healthz", timeout=probe_timeout)
+        except httpx.HTTPError as exc:
+            raise SearxngError(f"Could not reach SearXNG at {self._base_url}: {exc}") from exc
+        if resp.status_code >= 500:
+            raise SearxngError(f"SearXNG returned {resp.status_code}")
+
     def _build_params(self, req: SearchRequest) -> dict[str, str]:
         params: dict[str, str] = {"q": req.q, "format": "json", "pageno": str(req.pageno)}
         if req.categories:
@@ -88,18 +121,24 @@ class SearxngClient:
             if self._cache is not None:
                 cached = await self._cache.get(cache_key)
                 if cached is not None:
+                    metrics.record_cache("search", hit=True)
                     # Hand out a private copy: the cached model stays pristine even
                     # if the caller mutates what it got back.
                     return cached.model_copy(deep=True)
 
             inflight = self._inflight.get(cache_key)
             if inflight is None:
+                metrics.record_cache("search", hit=False)
                 break
 
             # Wait without adopting the future's cancellation: `asyncio.wait`
             # returns when it settles and only raises if *we* get cancelled.
             await asyncio.wait([inflight])
             if not inflight.cancelled():
+                # Counted as a hit: like a cache hit, a coalesced waiter costs no
+                # round-trip to SearXNG. Recording it keeps hits + misses equal to
+                # the number of searches asked for.
+                metrics.record_cache("search", hit=True)
                 # Raises here if the flight failed, so every waiter sees the error.
                 return inflight.result().model_copy(deep=True)
             # The leader was cancelled before finishing; retry (its registry entry
@@ -157,15 +196,25 @@ class SearxngClient:
         # but changes the response, so fold it into the key.
         items = sorted((k, v) for k, v in params.items() if k != "format")
         items.append(("max_results", str(req.max_results)))
+        # The domain filters are applied client-side, so they never reach `params`
+        # yet change the response: they belong in the key.
+        items.append(("include_domains", ",".join(sorted(req.include_domains or []))))
+        items.append(("exclude_domains", ",".join(sorted(req.exclude_domains or []))))
         return urlencode(items)
 
     @staticmethod
-    def _parse(req: SearchRequest, data: dict) -> SearchResponse:
+    def _parse(req: SearchRequest, data: dict[str, Any]) -> SearchResponse:
         raw_results = data.get("results", []) or []
+        include = {d.strip().lower().lstrip(".") for d in (req.include_domains or []) if d.strip()}
+        exclude = {d.strip().lower().lstrip(".") for d in (req.exclude_domains or []) if d.strip()}
         items: list[SearchResultItem] = []
         for r in raw_results:
             url = r.get("url")
             if not url:
+                continue
+            # Filtered before `max_results` is applied, so a caller asking for 5
+            # results on one domain gets 5 of them, not 5 minus whatever was dropped.
+            if (include or exclude) and not _domain_allowed(url, include, exclude):
                 continue
             items.append(
                 SearchResultItem(
@@ -183,11 +232,10 @@ class SearxngClient:
             items = items[: req.max_results]
 
         suggestions = [s for s in (data.get("suggestions") or []) if isinstance(s, str)]
-        answers = [
-            a.get("answer") if isinstance(a, dict) else a
-            for a in (data.get("answers") or [])
+        raw_answers = [
+            a.get("answer") if isinstance(a, dict) else a for a in (data.get("answers") or [])
         ]
-        answers = [a for a in answers if isinstance(a, str)]
+        answers = [a for a in raw_answers if isinstance(a, str)]
 
         return SearchResponse(
             query=req.q,

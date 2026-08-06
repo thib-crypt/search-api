@@ -79,9 +79,9 @@ class UrlGuard:
         if self.allowed_ports and port not in self.allowed_ports:
             raise BlockedUrlError(f"port {port} is not allowed")
 
-        if _matches(host, self.denylist):
+        if host_matches(host, self.denylist):
             raise BlockedUrlError(f"host '{host}' is denylisted")
-        if self.allowlist and not _matches(host, self.allowlist):
+        if self.allowlist and not host_matches(host, self.allowlist):
             raise BlockedUrlError(f"host '{host}' is not in the domain allowlist")
 
         return host, port
@@ -109,9 +109,7 @@ class UrlGuard:
         Resolution runs concurrently: a batch of 50 URLs costs one DNS round-trip,
         not fifty in series.
         """
-        checks = await asyncio.gather(
-            *(self.check(u) for u in urls), return_exceptions=True
-        )
+        checks = await asyncio.gather(*(self.check(u) for u in urls), return_exceptions=True)
         allowed: list[str] = []
         rejected: dict[str, str] = {}
         for url, outcome in zip(urls, checks, strict=True):
@@ -124,9 +122,17 @@ class UrlGuard:
         return allowed, rejected
 
 
-def _matches(host: str, domains: frozenset[str]) -> bool:
-    """True when ``host`` equals one of ``domains`` or is a subdomain of one."""
-    return any(host == d or host.endswith(f".{d}") for d in domains)
+def host_matches(host: str, domains: frozenset[str] | set[str] | list[str]) -> bool:
+    """True when ``host`` equals one of ``domains`` or is a subdomain of one.
+
+    Public because the search domain filters (§5.6) must match hosts exactly the
+    same way the guard's allow/deny lists do — two spellings of "is this host in
+    that list?" would be a bug waiting to happen.
+    """
+    host = host.lower().rstrip(".")
+    return any(
+        host == d or host.endswith(f".{d}") for d in (x.lower().lstrip(".") for x in domains)
+    )
 
 
 def _as_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -137,9 +143,7 @@ def _as_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         return None
 
 
-async def _resolve(
-    host: str, port: int
-) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+async def _resolve(host: str, port: int) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     loop = asyncio.get_running_loop()
     try:
         infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)

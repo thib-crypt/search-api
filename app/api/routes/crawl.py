@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.api.deps import get_crawler, get_jobs, get_url_guard, require_api_key
@@ -47,9 +49,9 @@ async def crawl_site(
     except BlockedUrlError as exc:
         raise HTTPException(status_code=400, detail=f"URL not allowed: {exc}") from exc
 
-    job = jobs.create("site_crawl")
+    job = await jobs.create("site_crawl")
 
-    async def task(emit: Emit) -> dict:
+    async def task(emit: Emit) -> dict[str, Any]:
         pages = await crawler.crawl_site(req, emit=emit)
         return {
             "base_url": str(req.url),

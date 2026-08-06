@@ -1,3 +1,6 @@
+import asyncio
+import json
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -83,6 +86,49 @@ async def test_stream_answer_yields_searching_tokens_done() -> None:
     assert event_types[0] == "searching"
     assert "token" in event_types
     assert event_types[-1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_crawling_before_it_blocks_on_the_crawl() -> None:
+    """The crawl event is a progress signal: it has to precede the crawl, not report it."""
+
+    class SlowCrawler(FakeCrawler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finished = False
+
+        async def crawl(self, req):
+            await asyncio.sleep(0.05)
+            pages = await super().crawl(req)
+            self.finished = True
+            return pages
+
+    crawler = SlowCrawler()
+    service = AnswerService(searxng=FakeSearxng(), crawler=crawler, llm=FakeLLM())
+    events = []
+    async for ev in service.stream_answer(AnswerRequest(query="q", stream=True)):
+        if ev["event"] == "crawling":
+            assert crawler.finished is False  # announced while it runs, not after
+        events.append(ev)
+
+    assert [e["event"] for e in events][:3] == ["searching", "crawling", "generating"]
+    assert events[-1]["event"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_answer_and_stream_build_the_same_context() -> None:
+    """`_prepare_context` is shared: the two entry points must feed the model alike."""
+    sync_llm = FakeLLM()
+    stream_llm = FakeLLM()
+    req = AnswerRequest(query="what is x?", max_sources=2)
+
+    sync_resp = await AnswerService(FakeSearxng(), FakeCrawler(), sync_llm).answer(req)
+    stream_service = AnswerService(FakeSearxng(), FakeCrawler(), stream_llm)
+    stream_events = [ev async for ev in stream_service.stream_answer(req)]
+
+    assert sync_llm.last_messages == stream_llm.last_messages
+    done = json.loads(stream_events[-1]["data"])
+    assert done["sources"] == [s.model_dump() for s in sync_resp.sources]
 
 
 @pytest.mark.asyncio

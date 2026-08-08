@@ -189,12 +189,40 @@ class Settings(BaseSettings):
         default=1.0,
         description="Minimum seconds between two hits on the same host. 0 disables it.",
     )
+    # --- Document ingestion (§15) ---
+    crawl_enable_documents: bool = Field(
+        default=True,
+        description=(
+            "Route document URLs (Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, "
+            "CSV, PDF) through anydoc instead of the browser. Off means those URLs go "
+            "to Chromium, which gets nothing out of them."
+        ),
+    )
+    crawl_doc_max_mb: float = Field(
+        default=25.0,
+        description=(
+            "Refuse documents larger than this many megabytes. Caps the DOWNLOAD; "
+            "decompression has its own limits inside anydoc."
+        ),
+    )
+    crawl_pdf_fallback: bool = Field(
+        default=True,
+        description=(
+            "Fall back to pypdf when anydoc fails on a PDF. Worth keeping on while "
+            "anydoc is still 0.1.x."
+        ),
+    )
+    convert_max_mb: float = Field(
+        default=25.0, description="Max size of a file uploaded to POST /v1/convert."
+    )
+    # Superseded by the two settings above. Kept working for one version because
+    # they are already deployed; `deprecation_warnings` says so at startup.
     crawl_enable_pdf: bool = Field(
         default=True,
-        description="Route PDF URLs through a text extractor instead of the browser.",
+        description="Deprecated alias for CRAWL_ENABLE_DOCUMENTS.",
     )
     crawl_pdf_max_mb: float = Field(
-        default=25.0, description="Refuse PDFs larger than this many megabytes."
+        default=25.0, description="Deprecated alias for CRAWL_DOC_MAX_MB."
     )
 
     # --- URL discovery (/v1/map) ---
@@ -292,6 +320,55 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- MCP server (Phase 14) ---
+    # The MCP surface is mounted in *this* process, on MCP_PATH, so it shares the
+    # browser pool, the SearXNG cache, the cost ledger and the JobManager with the
+    # HTTP API. See MCP_REFERENCE.md.
+    mcp_enabled: bool = Field(default=True)
+    mcp_path: str = Field(default="/mcp", description="Path the streamable-HTTP transport serves.")
+    mcp_allowed_hosts: str = Field(
+        default="",
+        description=(
+            "Comma-separated Host values the MCP transport accepts (DNS-rebinding "
+            "protection). In a container the request Host is not localhost, so an "
+            "empty list here would refuse every MCP request: empty therefore means "
+            "'accept any Host', which is safe behind a reverse proxy that already "
+            "pins it. Set it explicitly when the API is exposed directly."
+        ),
+    )
+    mcp_max_result_tokens: int = Field(
+        default=4000,
+        description=(
+            "Token ceiling on ONE tool result. This is agent context, not "
+            "bandwidth: whatever a tool returns is re-sent on every following turn."
+        ),
+    )
+    mcp_max_urls_per_call: int = Field(
+        default=10, description="Max URLs a single fetch_url call may take."
+    )
+    mcp_artifact_ttl: float = Field(
+        default=1800.0, description="Seconds a full tool payload stays readable as a resource."
+    )
+    mcp_artifact_max_items: int = Field(
+        default=256, description="Max artefacts kept in memory (least-recently-used evicted)."
+    )
+    mcp_image_mode: Literal["off", "resource", "inline"] = Field(
+        default="off",
+        description=(
+            "Screenshots and PDF renders are never inlined by default: base64 in a "
+            "tool result is context an agent pays for on every turn. 'resource' "
+            "returns a link the client may load; 'inline' embeds the image."
+        ),
+    )
+    mcp_research_max_concurrent: int = Field(
+        default=2,
+        description=(
+            "Simultaneous deep_research runs per API-key label. DAILY_COST_CAP_USD "
+            "is a finish-line limit; this one stops an agent loop from reaching it "
+            "in thirty seconds."
+        ),
+    )
+
     # --- Webhooks (§5.8) ---
     webhook_secret: str = Field(
         default="",
@@ -351,12 +428,68 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()] or ["*"]
 
     @property
+    def mcp_allowed_host_list(self) -> list[str]:
+        return [h.strip() for h in self.mcp_allowed_hosts.split(",") if h.strip()]
+
+    @property
     def report_model(self) -> str:
         return self.llm_report_model or self.llm_model
 
     @property
     def llm_fallback_model_list(self) -> list[str]:
         return [m.strip() for m in self.llm_fallback_models.split(",") if m.strip()]
+
+    @property
+    def documents_enabled(self) -> bool:
+        """CRAWL_ENABLE_DOCUMENTS, honouring the CRAWL_ENABLE_PDF alias (§15.7).
+
+        The new name wins whenever it was actually provided; the old one is only
+        consulted when it was set and the new one was not, so an operator who has
+        `CRAWL_ENABLE_PDF=false` deployed keeps the behaviour they asked for
+        instead of silently gaining fourteen formats on upgrade.
+        """
+        if self._alias_in_effect("crawl_enable_documents", "crawl_enable_pdf"):
+            return self.crawl_enable_pdf
+        return self.crawl_enable_documents
+
+    @property
+    def doc_max_mb(self) -> float:
+        """CRAWL_DOC_MAX_MB, honouring the CRAWL_PDF_MAX_MB alias (§15.7)."""
+        if self._alias_in_effect("crawl_doc_max_mb", "crawl_pdf_max_mb"):
+            return self.crawl_pdf_max_mb
+        return self.crawl_doc_max_mb
+
+    def _alias_in_effect(self, current: str, legacy: str) -> bool:
+        """Whether the deprecated name is the one that should be read.
+
+        ``model_fields_set`` is what makes this work: it holds the fields an
+        operator actually provided, so an unset new setting is distinguishable
+        from one explicitly set to its default value.
+        """
+        return current not in self.model_fields_set and legacy in self.model_fields_set
+
+    def deprecation_warnings(self) -> list[str]:
+        """Settings that still work but are on their way out (§15.7).
+
+        Returned rather than logged so the caller decides where they go, and so a
+        test can assert on them without capturing log records.
+        """
+        warnings: list[str] = []
+        for legacy, current in (
+            ("crawl_enable_pdf", "crawl_enable_documents"),
+            ("crawl_pdf_max_mb", "crawl_doc_max_mb"),
+        ):
+            if legacy in self.model_fields_set:
+                warnings.append(
+                    f"{legacy.upper()} is deprecated and will be removed in a future "
+                    f"version: use {current.upper()} instead."
+                    + (
+                        f" {current.upper()} is also set and takes precedence."
+                        if current in self.model_fields_set
+                        else ""
+                    )
+                )
+        return warnings
 
     @property
     def crawl_allowed_port_set(self) -> frozenset[int]:

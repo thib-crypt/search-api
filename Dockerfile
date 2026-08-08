@@ -23,6 +23,13 @@ COPY --from=ghcr.io/astral-sh/uv@sha256:069a51314a7bb6031777a9273205fe1b0b19e914
 # Dependencies come from uv.lock, not from the loose ranges in pyproject.toml, so
 # a rebuild installs the exact versions that were tested. --locked fails the build
 # if the lock has drifted from pyproject rather than silently re-resolving.
+#
+# Phase 14 note: the image carries two HTTP stacks. `mcp` depends on `httpx2` —
+# httpx 2.x republished under its own distribution name, top-level module
+# `httpx2` — while SearxngClient and litellm keep using `httpx` 0.28. The
+# namespaces are distinct, so there is no conflict; the cost is ~2 MB and a
+# dormant second stack. Nothing to fix, but worth knowing before someone spends
+# an afternoon on "why are httpx and httpx2 both installed".
 COPY --chmod=644 pyproject.toml uv.lock README.md ./
 RUN uv export --locked --no-dev --no-emit-project --format requirements-txt -o /tmp/requirements.txt \
     && uv pip install --system --no-cache -r /tmp/requirements.txt \

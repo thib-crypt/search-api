@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.routing import Route
 
 from app import __version__
 from app.api.middleware import (
@@ -16,7 +17,17 @@ from app.api.middleware import (
     RateLimitMiddleware,
     RequestContextMiddleware,
 )
-from app.api.routes import answer, crawl, extract, health, jobs, metrics, research, search
+from app.api.routes import (
+    answer,
+    convert,
+    crawl,
+    extract,
+    health,
+    jobs,
+    metrics,
+    research,
+    search,
+)
 from app.api.routes import map as map_routes  # aliased: `map` shadows the builtin
 from app.config import get_settings
 from app.core.cache import TTLCache
@@ -30,6 +41,9 @@ from app.core.search.searxng import SearxngClient
 from app.core.tracing import setup_tracing
 from app.jobs.manager import JobManager
 from app.jobs.store import build_job_store
+from app.mcp.artifacts import ArtifactStore
+from app.mcp.guards import ConcurrencyBound
+from app.mcp.server import build_http_app, build_server, mcp_endpoint
 
 logger = logging.getLogger("unified_search_api")
 
@@ -53,6 +67,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # §7.3: opt-in, best-effort. Never aborts startup.
     if settings.otel_enabled:
         setup_tracing(app, service_name=settings.app_name)
+    # §15.7: the renamed crawl settings still work, but say so once at startup —
+    # silently honouring a name that is on its way out is how a rename turns into
+    # a surprise two versions later.
+    for warning in settings.deprecation_warnings():
+        logger.warning("%s", warning)
     if not settings.auth_enabled and settings.environment != "development":
         logger.warning(
             "AUTH_ENABLED is false in environment=%s: every caller can spend your "
@@ -76,8 +95,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout=settings.crawl_timeout,
         guard=app.state.url_guard,
         per_host_delay=settings.crawl_per_host_delay,
-        enable_pdf=settings.crawl_enable_pdf,
-        pdf_max_mb=settings.crawl_pdf_max_mb,
+        enable_documents=settings.documents_enabled,
+        doc_max_mb=settings.doc_max_mb,
+        pdf_fallback=settings.crawl_pdf_fallback,
     )
     app.state.llm = LLMClient(
         default_model=settings.llm_model,
@@ -116,16 +136,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         vacuum_interval_seconds=settings.job_vacuum_interval_seconds,
     )
     await app.state.jobs.start()
-    try:
-        yield
-    finally:
-        # Cancel in-flight jobs before tearing down the clients they depend on.
-        await app.state.jobs.shutdown()
-        close_ledger = getattr(app.state.cost_ledger, "close", None)
-        if close_ledger is not None:
-            await close_ledger()
-        await app.state.searxng.aclose()
-        await app.state.crawler.close()
+
+    # §3: full tool payloads behind the truncated results MCP hands back. In
+    # memory and bounded, like every other cache here.
+    app.state.mcp_artifacts = ArtifactStore(
+        ttl=settings.mcp_artifact_ttl, max_items=settings.mcp_artifact_max_items
+    )
+    # §6.3: the agent-specific guard rail. The daily cap stops the spending; this
+    # stops a loop from reaching the cap in thirty seconds.
+    app.state.mcp_research_bound = ConcurrencyBound(limit=settings.mcp_research_max_concurrent)
+    app.state.mcp_app = None
+    async with AsyncExitStack() as stack:
+        if settings.mcp_enabled:
+            # Built here, not at import: a StreamableHTTPSessionManager may only
+            # be run once, so a process that starts the app twice (every test
+            # that opens a TestClient does) needs a fresh server each time. The
+            # route registered below resolves this through app.state.
+            mcp_server = build_server(app.state)
+            app.state.mcp_app = build_http_app(mcp_server, settings)
+            # The mounted app's own lifespan never runs — Starlette only runs the
+            # outermost one — so its session manager is started from here.
+            await stack.enter_async_context(mcp_server.session_manager.run())
+            logger.info("MCP server mounted on %s", settings.mcp_path)
+        try:
+            yield
+        finally:
+            # Cancel in-flight jobs before tearing down the clients they depend on.
+            await app.state.jobs.shutdown()
+            close_ledger = getattr(app.state.cost_ledger, "close", None)
+            if close_ledger is not None:
+                await close_ledger()
+            await app.state.searxng.aclose()
+            await app.state.crawler.close()
+            app.state.mcp_app = None
 
 
 app = FastAPI(
@@ -159,6 +202,11 @@ app.add_middleware(
     allow_origins=settings.cors_origin_list,
     allow_methods=["*"],
     allow_headers=["*"],
+    # §6.5: `allow_headers=["*"]` already covers the Mcp-* request headers, but a
+    # browser-based MCP client cannot *read* a response header it was not granted.
+    # Without this, such a client never sees the session id the streamable-HTTP
+    # transport issues, so it cannot hold a session at all.
+    expose_headers=["Mcp-Session-Id", "Mcp-Protocol-Version", "X-Request-ID"],
 )
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(RateLimitMiddleware)
@@ -187,10 +235,13 @@ async def root() -> dict[str, object]:
             "/v1/crawl/site",
             "/v1/extract",
             "/v1/map",
+            "/v1/convert",
             "/v1/answer",
             "/v1/research",
             "/v1/jobs/{id}",
         ],
+        # Phase 14: the same capabilities as MCP tools, for agent clients.
+        "mcp": settings.mcp_path if settings.mcp_enabled else None,
     }
 
 
@@ -200,6 +251,16 @@ app.include_router(search.router)
 app.include_router(crawl.router)
 app.include_router(extract.router)
 app.include_router(map_routes.router)
+app.include_router(convert.router)
 app.include_router(answer.router)
 app.include_router(research.router)
 app.include_router(jobs.router)
+
+# The MCP transport, at exactly `MCP_PATH` — a plain Starlette route rather than
+# `app.mount()`. A Mount only matches `MCP_PATH + "/"`, so every client
+# configured with `https://host/mcp` would collect a 307 before each request.
+# The endpoint is a shim (`mcp_endpoint`) because the app behind it is rebuilt on
+# each startup; it answers 404 when MCP_ENABLED is false, like any unknown path.
+app.router.routes.append(
+    Route(settings.mcp_path, endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"])
+)

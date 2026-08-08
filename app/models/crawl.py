@@ -75,6 +75,14 @@ class CrawledPage(BaseModel):
     internal_links: int = 0
     external_links: int = 0
     error: str | None = None
+    source_format: str | None = Field(
+        default=None,
+        description=(
+            "What the content was read from: 'html' for a browser-rendered page, or "
+            "the document format ('pdf', 'docx', 'xlsx', ...) when the URL served a "
+            "document. Lets a caller weigh how much structure to trust."
+        ),
+    )
     # --- Optional formats (§5.3). Populated only when asked for in `formats`. ---
     html: str | None = Field(
         default=None, description="Cleaned HTML of the page (falls back to the raw HTML)."

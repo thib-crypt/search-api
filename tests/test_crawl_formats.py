@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import httpx
 import respx
 
-from app.core.crawl.crawler import CrawlerService, _looks_like_pdf_url, _pdf_to_markdown
+from app.core.crawl.crawler import (
+    CrawlerService,
+    _looks_like_document_url,
+    _pdf_to_markdown,
+)
 from app.core.net.guard import UrlGuard
 from app.models.crawl import CrawlRequest
 
@@ -122,10 +126,10 @@ def _minimal_pdf(text: str = "Hello PDF") -> bytes:
     return bytes(out)
 
 
-def test_pdf_url_detection() -> None:
-    assert _looks_like_pdf_url("https://example.com/report.PDF")
-    assert _looks_like_pdf_url("https://arxiv.org/pdf/2301.00001")  # extensionless
-    assert not _looks_like_pdf_url("https://example.com/article")
+def test_document_url_detection() -> None:
+    assert _looks_like_document_url("https://example.com/report.PDF")
+    assert _looks_like_document_url("https://arxiv.org/pdf/2301.00001")  # extensionless
+    assert not _looks_like_document_url("https://example.com/article")
 
 
 def test_pdf_to_markdown_extracts_page_sections() -> None:
@@ -198,7 +202,7 @@ async def test_oversized_pdf_is_a_clean_failure() -> None:
             headers={"content-type": "application/pdf"},
         )
     )
-    service = _pdf_service(pdf_max_mb=0.001)  # ~1 KB
+    service = _pdf_service(doc_max_mb=0.001)  # ~1 KB
 
     pages = await service.crawl(CrawlRequest(urls=["https://example.com/huge.pdf"]))
 
@@ -238,7 +242,7 @@ async def test_non_pdf_at_a_pdf_looking_url_falls_back_to_the_browser() -> None:
 @respx.mock
 async def test_pdf_ingestion_can_be_disabled() -> None:
     service = CrawlerService(
-        guard=UrlGuard(allow_private=True), per_host_delay=0.0, enable_pdf=False
+        guard=UrlGuard(allow_private=True), per_host_delay=0.0, enable_documents=False
     )
 
     class Browser:

@@ -21,8 +21,20 @@ dependencies = [
     "python-multipart>=0.0.12",
     "sse-starlette>=2.1",
     "orjson>=3.10",
+    # Phase 15 §8: pinned to an exact version, not a range. The project is young
+    # (0.1.x, published August 2026) and parses untrusted bytes from the internet;
+    # a patch release must land through a reviewed bump, not through a rebuild.
+    "firecrawl-anydoc==0.1.7",
+    # Kept alongside anydoc as the PDF fallback (CRAWL_PDF_FALLBACK, §8): the
+    # previous extraction path stays reachable by one environment variable.
     "pypdf>=6.15.0",
     "aiosqlite>=0.22.1",
+    # Phase 14: the MCP server layer (app/mcp/). Upper-bounded on purpose — the
+    # 1.x -> 2.x migration renamed FastMCP to MCPServer and moved Context, so a
+    # 3.x would move the same ground again. Pulls httpx2 (httpx 2.x republished
+    # under its own distribution name, top-level module `httpx2`): no conflict
+    # with the httpx 0.28 that SearxngClient and litellm use.
+    "mcp>=2.0,<3",
     "prometheus-client>=0.26.0",
     "opentelemetry-sdk>=1.44.0",
     "opentelemetry-exporter-otlp-proto-http>=1.44.0",
@@ -38,6 +50,10 @@ dev = [
     "respx>=0.21",
     "ruff>=0.8",
     "mypy>=1.13",
+    # Phase 14: the MCP tests drive the app over a real ASGI transport rather
+    # than TestClient, because an MCP session is long-lived and asynchronous.
+    # That means running the lifespan by hand, which is all this provides.
+    "asgi-lifespan>=2.1",
 ]
 # Kept out of `dev` deliberately: locust pulls gevent, flask and a dozen other
 # packages that CI would install on every run and never use. The load tests are

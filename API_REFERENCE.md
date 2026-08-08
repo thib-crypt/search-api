@@ -27,11 +27,13 @@ Interactive docs are also served at `/docs` (Swagger UI) and `/redoc` when the s
   - [POST /v1/crawl/site](#post-v1crawlsite)
   - [POST /v1/extract](#post-v1extract)
   - [POST /v1/map](#post-v1map)
+  - [POST /v1/convert](#post-v1convert)
   - [POST /v1/answer](#post-v1answer)
   - [POST /v1/research](#post-v1research)
   - [GET /v1/jobs/{job\_id}](#get-v1jobsjob_id)
   - [DELETE /v1/jobs/{job\_id}](#delete-v1jobsjob_id)
   - [GET /v1/jobs/{job\_id}/stream](#get-v1jobsjob_idstream)
+  - [POST /mcp](#post-mcp)
 - [Schemas](#schemas)
 - [Configuration reference](#configuration-reference)
 - [SSE streaming format](#sse-streaming-format)
@@ -131,12 +133,32 @@ deep-research runs a minute through:
 | Path | Weight |
 |---|---|
 | `/v1/search` | 1 |
-| `/v1/map` | 2 |
+| `/v1/map`, `/v1/convert` | 2 |
 | `/v1/crawl` | 5 |
 | `/v1/answer`, `/v1/extract` | 10 |
 | `/v1/crawl/site` | 25 |
 | `/v1/research` | 100 |
 | anything else (e.g. `/v1/jobs/*`) | 1 |
+
+**MCP tools are priced the same way**, from the same table: the same work costs the same
+points whether it was asked for over HTTP or over `/mcp`.
+
+| Tool | Weight |
+|---|---|
+| `web_search`, `deep_research_estimate`, `job_status` | 1 |
+| `map_site` | 2 |
+| `fetch_url` | 5 |
+| `answer`, `extract_structured` | 10 |
+| `crawl_site` | 25 |
+| `deep_research` | 100 |
+
+This takes two steps, because the middleware runs *before* routing and sees only the path
+`/mcp` — every tool would otherwise cost 1 point. It charges that 1 point on the way in, and
+the MCP layer debits the remainder once it knows which tool was called, against the same
+sliding window. A refused call is not charged at all, and the refusal tells the agent what
+the tool costs and when the budget frees up, so it can pick a cheaper tool instead of
+retrying into the same wall. The stdio transport has no window to draw from and is not
+rate-limited.
 
 The window is keyed on the caller's **API-key label** when auth is enabled, and on the client IP
 otherwise — so one client exhausting its budget never starves another sharing the same egress IP.
@@ -289,9 +311,13 @@ Returns API metadata and a list of available endpoints.
   "name": "Unified Search API",
   "version": "0.1.0",
   "docs": "/docs",
-  "endpoints": ["/v1/search", "/v1/crawl", "/v1/crawl/site", "/v1/extract", "/v1/map", "/v1/answer", "/v1/research", "/v1/jobs/{id}"]
+  "endpoints": ["/v1/search", "/v1/crawl", "/v1/crawl/site", "/v1/extract", "/v1/map", "/v1/convert", "/v1/answer", "/v1/research", "/v1/jobs/{id}"],
+  "mcp": "/mcp"
 }
 ```
+
+`mcp` is the path the [MCP server](#post-mcp) is served on, or `null` when `MCP_ENABLED=false` —
+so an agent client can discover the transport without being told where it lives.
 
 ---
 
@@ -373,12 +399,16 @@ limiting**: a scrape runs on its own schedule and must not draw down a caller's 
 | `http_request_duration_seconds` | histogram | `method`, `route`, `status_code` | Request latency. `route` is the *template* (`/v1/jobs/{job_id}`), never the raw path |
 | `http_requests_total` | counter | `method`, `route`, `status_code` | Requests served. Error rate is `rate(http_requests_total{status_code=~"5.."}[5m]) / rate(http_requests_total[5m])` |
 | `cache_requests_total` | counter | `cache` (`search`/`answer`/`rerank`), `outcome` (`hit`/`miss`) | Cache effectiveness. A search coalesced into an in-flight identical query counts as a hit |
-| `crawl_pages_total` | counter | `outcome` (`success`/`failure`) | Pages the crawler returned, blocked and failed ones included |
+| `crawl_pages_total` | counter | `outcome` (`success`/`failure`), `source_format` | Pages the crawler returned, blocked and failed ones included. `source_format` is `html` for a browser-rendered page, the document format (`pdf`, `docx`, `xlsx`, …) for an ingested one, or `unknown` for a page that failed before anything was read — so `sum by (source_format)` shows how much of a run came out of office documents |
 | `crawler_browser_sessions_active` | gauge | — | Browser sessions holding a slot in the concurrency pool right now (ceiling: `CRAWL_MAX_CONCURRENCY`) |
 | `jobs_active` | gauge | `type` | Non-terminal background jobs, recomputed at scrape time |
 | `llm_tokens_total` | counter | `label`, `kind` (`prompt`/`completion`) | Tokens billed per API-key label |
 | `llm_cost_usd_total` | counter | `label` | Estimated spend per API-key label (same advisory figure as [Usage accounting](#usage-accounting)) |
 | `research_pages_skipped_by_rerank_total` | counter | — | Pages the pre-crawl reranker dropped, i.e. crawls and tokens not paid for |
+| `mcp_tool_calls_total` | counter | `tool`, `label`, `outcome` (`success`/`error`/`refused`) | MCP tool calls. `refused` is a call the rate limiter, the daily cap or the research concurrency bound turned away **before** it spent anything — the series worth alerting on |
+| `mcp_tool_duration_seconds` | histogram | `tool` | Wall-clock duration of a tool call. A `crawl_site` or `deep_research` call returns a job id, so its duration is the submission, not the run |
+| `mcp_result_tokens` | histogram | `tool` | Tokens of text handed back **after** budgeting — the check that `MCP_MAX_RESULT_TOKENS` survives contact with real pages |
+| `mcp_artifacts_stored` | gauge | — | Full tool payloads currently held in the artifact store (ceiling: `MCP_ARTIFACT_MAX_ITEMS`) |
 
 ```bash
 curl -H "X-API-Key: $API_KEY" http://localhost:8000/metrics
@@ -543,6 +573,7 @@ are refused. Results are returned in the order they were requested, one entry pe
 | `internal_links` | `integer` | Number of internal links found on the page |
 | `external_links` | `integer` | Number of external links found on the page |
 | `error` | `string \| null` | Error message if `success=false` |
+| `source_format` | `string \| null` | What the content was read from: `"html"` for a browser-rendered page, or the document format (`"pdf"`, `"docx"`, `"xlsx"`, …) |
 | `html` | `string \| null` | Cleaned HTML — only with `"html"` in `formats` |
 | `screenshot` | `string \| null` | Base64 PNG — only with `"screenshot"` in `formats` |
 | `pdf` | `string \| null` | Base64 PDF render — only with `"pdf"` in `formats` |
@@ -552,13 +583,35 @@ are refused. Results are returned in the order they were requested, one entry pe
 Fields not covered by the requested `formats` are `null`. The default (`["markdown"]`) returns
 exactly what v0.1 returned, so existing callers see no change.
 
-**PDF sources.** When `CRAWL_ENABLE_PDF=true` (the default), a URL that looks like a PDF
-(`.pdf` suffix, or a `/pdf/` path segment for arXiv-style links) is downloaded and text-extracted
-with `pypdf` instead of being rendered by the browser. The Markdown carries one `## Page n`
-section per page, and `"pdf"` in `formats` returns the original bytes base64-encoded. A URL that
-turns out not to serve `application/pdf` transparently falls back to the browser. PDFs over
-`CRAWL_PDF_MAX_MB` are reported as a per-URL failure, never as a crash. `/v1/answer` and
-`/v1/research` benefit automatically, since both crawl arbitrary search results.
+**Document sources.** When `CRAWL_ENABLE_DOCUMENTS=true` (the default), a URL that serves a
+document is downloaded and converted to Markdown instead of being handed to the browser, which
+would only download it again and render an empty page. Word, PowerPoint, Excel, OpenDocument,
+RTF, EPUB, CSV and PDF are covered; **tables come back as Markdown tables**, headings as
+headings, lists with their original numbering.
+
+The format is decided by the **bytes**, in this order:
+
+1. the file's signature (PDF header, RTF open group, OLE stream names, ZIP package mimetype);
+2. the `Content-Type` header, as a tie-breaker only;
+3. the URL's extension — the only evidence for a signature-less format such as CSV.
+
+That ordering is deliberate: document portals mislabel downloads constantly, so a real `.docx`
+served as `application/octet-stream` is read correctly, and an HTML error page served as
+`application/pdf` is not. A URL that turns out not to serve a document falls back to the browser
+transparently. A URL with no extension at all (`/download?id=4021`) is given a **second chance**:
+if the browser returns a successful but wordless page, the document path is tried once before the
+result is returned.
+
+`source_format` on each result says what was read. `"pdf"` in `formats` returns the original
+bytes base64-encoded, and only for an actual PDF. Documents over `CRAWL_DOC_MAX_MB` are reported
+as a per-URL failure, never as a crash; so are unreadable ones, with the reason named
+(`EncryptedError` for a password-protected file). `/v1/extract`, `/v1/answer` and `/v1/research`
+benefit automatically, since all three crawl arbitrary search results.
+
+**No OCR.** A scanned PDF — an image with no text layer — has nothing to extract, and comes back
+as an explicit failure rather than a silently empty page. `CRAWL_PDF_FALLBACK=true` (the default)
+additionally retries PDFs through `pypdf` when the converter fails on them, which keeps the
+pre-Phase-15 extraction path one environment variable away.
 
 **Example:**
 
@@ -740,6 +793,64 @@ curl -X POST http://localhost:8000/v1/map \
 
 ```json
 { "links": ["https://example.com/pricing"], "count": 1, "source": "sitemap" }
+```
+
+---
+
+### POST /v1/convert
+
+Converts an uploaded document to Markdown. Same converter as the crawl path, applied to a file you
+send directly instead of one fetched from a URL.
+
+`Content-Type: multipart/form-data`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `file` | file | Yes | The document to convert |
+| `format` | `string` | No | Names the format instead of letting it be detected. Required for CSV, which carries no signature in its bytes. One of `doc`, `docx`, `odt`, `pdf`, `ppt`, `pptx`, `rtf`, `epub`, `xlsx`, `ods`, `odp`, `csv` |
+
+**Response**
+
+| Field | Type | Description |
+|---|---|---|
+| `markdown` | `string` | GitHub-Flavored Markdown rendering of the document |
+| `format` | `string` | The format the document was actually read as. May differ from `format` in the request when the bytes said otherwise, and from the file's extension for container variants (a `.docm` reads as `docx`) |
+| `title` | `string \| null` | The document's first heading, or `null` when it opens without one |
+| `word_count` | `integer` | Words in `markdown` |
+
+**Errors**
+
+| Status | When |
+|---|---|
+| `400` | The file could not be converted. The `detail` names the reason — `EncryptedError` (password-protected), `MalformedError` (structurally unusable), `UnsupportedError` (unknown format, or a scanned PDF that would need OCR), `ResourceLimitError` (a safety limit such as decompression was crossed) |
+| `400` | The format could not be determined and no usable `format` was given |
+| `413` | The upload is over `CONVERT_MAX_MB` |
+
+An unreadable file is the caller's problem, not the server's, so it is a `400` and never a `500`.
+
+**Two things worth knowing.** The bytes outrank the `format` field, exactly as on the crawl path:
+the converter does what it is told, so honouring `format=csv` on a `.docx` would return a `200`
+carrying mojibake — a wrong answer with no way for the caller to detect it. And this is the only
+endpoint in the API that fetches nothing, so the SSRF guard has nothing to check here; the bytes
+come from the client. `CONVERT_MAX_MB` bounds what reaches memory and the converter, but the
+multipart body is already spooled to disk by the ASGI server before any of this runs — bound the
+transfer itself at your reverse proxy (`client_max_body_size` and equivalents).
+
+**Example:**
+
+```bash
+curl -X POST http://localhost:8000/v1/convert \
+  -H "X-API-Key: <your key>" \
+  -F "file=@rapport-annuel.xlsx"
+```
+
+```json
+{
+  "markdown": "# Rapport trimestriel\n\n|Region|T1|T2|\n|---|---|---|\n|EMEA|1200|1450|\n",
+  "format": "xlsx",
+  "title": "Rapport trimestriel",
+  "word_count": 12
+}
 ```
 
 ---
@@ -1049,6 +1160,64 @@ es.addEventListener('failed', (e) => { console.error(JSON.parse(e.data).error); 
 
 ---
 
+### POST /mcp
+
+The [Model Context Protocol](https://modelcontextprotocol.io) surface, served over the
+streamable-HTTP transport at `MCP_PATH` (default `/mcp`). Nine tools — `web_search`,
+`fetch_url`, `map_site`, `crawl_site`, `extract_structured`, `answer`, `deep_research`,
+`deep_research_estimate`, `job_status` — plus resources and prompts.
+
+This is a **protocol endpoint, not a REST one**: the body is JSON-RPC and the session is
+negotiated by the transport, so point an MCP client at the URL rather than hand-writing
+requests. The same path also answers `GET` (the server→client event stream) and `DELETE`
+(session termination); the client handles both. It is deliberately absent from
+`/openapi.json` and `/docs` for the same reason: an OpenAPI operation describes a request
+shape, and there is one JSON-RPC envelope here rather than nine. The tool schemas are
+published over the protocol itself, by `tools/list`.
+
+The server runs **in this process**, not as a sidecar calling the HTTP API back — one
+browser pool, one search cache, one cost ledger, one job manager. A `crawl_site` or
+`deep_research` tool call therefore returns an ordinary job id: the agent polls it with
+`job_status`, and you can watch the very same job at [`GET /v1/jobs/{job_id}`](#get-v1jobsjob_id),
+stream it at [`/stream`](#get-v1jobsjob_idstream) or cancel it with
+[`DELETE /v1/jobs/{job_id}`](#delete-v1jobsjob_id).
+
+**Auth required:** When `AUTH_ENABLED=true` — the same `API_KEYS`, resolved to the same
+labels with the same constant-time comparison as `/v1/*`. Clients send the key as
+`Authorization: Bearer <key>`, the header the MCP transport reads. With `AUTH_ENABLED=false`
+the MCP surface is open, exactly like `/v1/*`.
+
+```jsonc
+{
+  "mcpServers": {
+    "search-api": {
+      "type": "http",
+      "url": "https://your-host/mcp",
+      "headers": { "Authorization": "Bearer <your key>" }
+    }
+  }
+}
+```
+
+Rate limiting is per **tool**, not per request — see [Rate limiting](#rate-limiting).
+Every tool result is capped at `MCP_MAX_RESULT_TOKENS` (default `4000`) because a tool
+result is re-sent on every following agent turn; the cut is marked in place and the full
+payload stays readable as a `search-api://artifact/{id}` resource.
+
+**Response `404`** when `MCP_ENABLED=false`:
+
+```json
+{
+  "detail": "MCP server is not enabled on this instance."
+}
+```
+
+The tool catalogue with every argument, the resource URIs, the prompts and the per-client
+setup (including the stdio mode, `python -m app.mcp`) are documented in
+[`MCP_REFERENCE.md`](MCP_REFERENCE.md).
+
+---
+
 ## Schemas
 
 ### SearchRequest
@@ -1115,6 +1284,17 @@ es.addEventListener('failed', (e) => { console.error(JSON.parse(e.data).error); 
   "url": "https://example.com",
   "search": null,
   "limit": 100
+}
+```
+
+### ConvertResponse
+
+```json
+{
+  "markdown": "# Rapport trimestriel\n\n|Region|T1|T2|\n|---|---|---|\n|EMEA|1200|1450|\n",
+  "format": "xlsx",
+  "title": "Rapport trimestriel",
+  "word_count": 12
 }
 ```
 
@@ -1256,8 +1436,12 @@ Any other provider API key recognised by [litellm](https://docs.litellm.ai/docs/
 | `CRAWL_MAX_CONCURRENCY` | `5` | Max concurrent browser sessions, **process-wide** (not per request) |
 | `CRAWL_TIMEOUT` | `30.0` | Per-page crawl timeout in seconds |
 | `CRAWL_PER_HOST_DELAY` | `1.0` | Min seconds between two hits on the same host; distinct hosts are never delayed |
-| `CRAWL_ENABLE_PDF` | `true` | Route PDF URLs through `pypdf` text extraction instead of the browser |
-| `CRAWL_PDF_MAX_MB` | `25` | Refuse PDFs larger than this (reported as a per-URL failure) |
+| `CRAWL_ENABLE_DOCUMENTS` | `true` | Convert document URLs (Word, Excel, PowerPoint, OpenDocument, RTF, EPUB, CSV, PDF) to Markdown instead of rendering them |
+| `CRAWL_DOC_MAX_MB` | `25` | Refuse documents larger than this (reported as a per-URL failure). Caps the **download**; decompression has its own limits inside the parser |
+| `CRAWL_PDF_FALLBACK` | `true` | Fall back to `pypdf` when the converter fails on a PDF |
+| `CONVERT_MAX_MB` | `25` | Max size of a file uploaded to `POST /v1/convert` |
+| `CRAWL_ENABLE_PDF` | — | **Deprecated** alias for `CRAWL_ENABLE_DOCUMENTS`; honoured for one more version, with a warning at startup |
+| `CRAWL_PDF_MAX_MB` | — | **Deprecated** alias for `CRAWL_DOC_MAX_MB`; same treatment |
 
 ### URL discovery
 
@@ -1311,6 +1495,24 @@ Any other provider API key recognised by [litellm](https://docs.litellm.ai/docs/
 |---|---|---|
 | `DAILY_COST_CAP_USD` | `0` | Max USD per API-key label per UTC day across `/v1/research` and `/v1/answer` (`0` disables). Durable with `JOB_BACKEND=sqlite`; resets on restart with `JOB_BACKEND=memory` |
 | `RESEARCH_MAX_COST_USD` | `0` | Per-run ceiling — see the Research table above |
+
+### MCP server
+
+The MCP surface is mounted in *this* process (see [`POST /mcp`](#post-mcp)), so it inherits
+`CRAWL_MAX_CONCURRENCY`, the search cache, the cost ledger and the job manager from the
+settings above. What follows is only what is specific to it.
+
+| Variable | Default | Description |
+|---|---|---|
+| `MCP_ENABLED` | `true` | Serve the MCP surface. While false, `MCP_PATH` answers `404` like any unknown route |
+| `MCP_PATH` | `/mcp` | Path the streamable-HTTP transport serves |
+| `MCP_ALLOWED_HOSTS` | `""` | Comma-separated `Host` values the transport accepts (DNS-rebinding protection). Empty means **accept any Host**, not "refuse every one": in a container the request Host is the service name or your domain, never localhost, so the SDK's default allow-list would turn away every MCP request. Safe behind a reverse proxy that pins the Host; set it explicitly when the API is exposed directly |
+| `MCP_MAX_RESULT_TOKENS` | `4000` | Token ceiling on **one** tool result. This is agent context, not bandwidth: whatever a tool returns is re-sent on every following turn. Truncation is from the top (the head of a page is what an agent needs to judge the rest), the cut is marked in place, and the remainder stays readable as a `search-api://artifact/{id}` resource. The budget is shared across the pages of a multi-URL call, never multiplied by them |
+| `MCP_MAX_URLS_PER_CALL` | `10` | Max URLs a single `fetch_url` call may take. Lower than the HTTP cap on purpose: that one bounds the server's work, this one bounds an agent loop's |
+| `MCP_ARTIFACT_TTL` | `1800` | Seconds a full tool payload stays readable as a resource |
+| `MCP_ARTIFACT_MAX_ITEMS` | `256` | Max artefacts kept in memory (least-recently-used evicted) |
+| `MCP_IMAGE_MODE` | `off` | `off`, `resource` or `inline`. Screenshots and PDF renders are never inlined by default: base64 in a tool result is context the agent pays for on every turn. `resource` returns a link the client may load; `inline` embeds the image |
+| `MCP_RESEARCH_MAX_CONCURRENT` | `2` | Simultaneous `deep_research` runs per API-key label. `DAILY_COST_CAP_USD` is a finish-line limit; this one stops an agent loop from reaching it in thirty seconds |
 
 ### Webhooks
 

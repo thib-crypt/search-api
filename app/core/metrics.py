@@ -19,6 +19,7 @@ level. The same rule the cost ledger follows in `app.api.deps.record_spend`.
 from __future__ import annotations
 
 import logging
+from collections import Counter as _Counter
 from collections.abc import Mapping
 from typing import Any
 
@@ -59,10 +60,14 @@ CACHE_REQUESTS = Counter(
 )
 
 # -- Crawler ---------------------------------------------------------------
+# `source_format` splits browser-rendered pages from ingested documents (§15.4.5),
+# which is the only way to see how much of a research run actually came out of
+# spreadsheets and reports. Bounded by the formats anydoc supports (~15 values),
+# and `sum by (outcome)` still yields the pre-Phase-15 series.
 CRAWL_PAGES = Counter(
     "crawl_pages_total",
-    "Pages returned by the crawler, by outcome.",
-    ("outcome",),
+    "Pages returned by the crawler, by outcome and what they were read from.",
+    ("outcome", "source_format"),
 )
 BROWSER_SESSIONS_ACTIVE = Gauge(
     "crawler_browser_sessions_active",
@@ -95,6 +100,58 @@ RERANK_SKIPPED_PAGES = Counter(
 )
 
 
+# -- MCP (Phase 14) --------------------------------------------------------
+# `tool` and `label` are both bounded: nine tool names, and labels come from
+# API_KEYS. `outcome` is success | error | refused -- "refused" being a call the
+# rate limiter, the daily cap or the concurrency bound turned away *before* it
+# spent anything, which is the series worth alerting on.
+MCP_TOOL_CALLS = Counter(
+    "mcp_tool_calls_total",
+    "MCP tool calls, by tool, API-key label and outcome.",
+    ("tool", "label", "outcome"),
+)
+MCP_TOOL_DURATION = Histogram(
+    "mcp_tool_duration_seconds",
+    "Wall-clock duration of an MCP tool call.",
+    ("tool",),
+)
+# The check that MCP_MAX_RESULT_TOKENS survives contact with real pages. A
+# histogram, not a counter: the question is the shape of the tail, not the total.
+MCP_RESULT_TOKENS = Histogram(
+    "mcp_result_tokens",
+    "Tokens of text returned by an MCP tool call, after budgeting (§3).",
+    ("tool",),
+    buckets=(100, 250, 500, 1000, 2000, 4000, 8000, 16000),
+)
+MCP_ARTIFACTS_STORED = Gauge(
+    "mcp_artifacts_stored",
+    "Tool payloads currently held in the artifact store.",
+)
+
+
+def record_mcp_call(tool: str, label: str, outcome: str, duration_seconds: float) -> None:
+    """One finished MCP tool call."""
+    try:
+        MCP_TOOL_CALLS.labels(tool, label, outcome).inc()
+        MCP_TOOL_DURATION.labels(tool).observe(duration_seconds)
+    except Exception:  # noqa: BLE001 - never let a metric fail a tool call
+        logger.debug("Could not record MCP call metrics", exc_info=True)
+
+
+def record_mcp_result_tokens(tool: str, tokens: int) -> None:
+    try:
+        MCP_RESULT_TOKENS.labels(tool).observe(tokens)
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not record MCP result size", exc_info=True)
+
+
+def set_mcp_artifacts(count: int) -> None:
+    try:
+        MCP_ARTIFACTS_STORED.set(count)
+    except Exception:  # noqa: BLE001
+        logger.debug("Could not sample the artifact gauge", exc_info=True)
+
+
 def normalize_method(method: str) -> str:
     method = (method or "").upper()
     return method if method in _KNOWN_METHODS else _OTHER_METHOD
@@ -119,14 +176,20 @@ def record_cache(cache: str, *, hit: bool) -> None:
 
 
 def record_crawled_pages(pages: Any) -> None:
-    """Count an iterable of ``CrawledPage`` by ``success``."""
+    """Count an iterable of ``CrawledPage`` by outcome and source format.
+
+    A page that never produced content (blocked, failed before a fetch) has no
+    source format and is counted as ``unknown`` rather than being attributed to
+    the browser it never reached.
+    """
     try:
-        success = sum(1 for page in pages if getattr(page, "success", False))
-        total = len(pages)
-        if success:
-            CRAWL_PAGES.labels("success").inc(success)
-        if total - success:
-            CRAWL_PAGES.labels("failure").inc(total - success)
+        # Aliased at the import: `Counter` here is prometheus_client's.
+        tally: _Counter[tuple[str, str]] = _Counter()
+        for page in pages:
+            outcome = "success" if getattr(page, "success", False) else "failure"
+            tally[(outcome, getattr(page, "source_format", None) or "unknown")] += 1
+        for (outcome, source_format), count in tally.items():
+            CRAWL_PAGES.labels(outcome, source_format).inc(count)
     except Exception:  # noqa: BLE001
         logger.debug("Could not record crawl metrics", exc_info=True)
 

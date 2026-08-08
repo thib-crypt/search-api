@@ -4,7 +4,9 @@ A self-hosted, open-source API that unifies three capabilities behind one HTTP s
 
 - 🔎 **Web search** — powered by a bundled [SearXNG](https://github.com/searxng/searxng) instance (no third-party search SaaS).
 - 🕷️ **Crawling** — single pages or whole sites via [crawl4ai](https://github.com/unclecode/crawl4ai), returning clean Markdown.
+- 📄 **Document ingestion** — Word, PowerPoint, Excel, OpenDocument, RTF, EPUB, CSV and PDF read into Markdown via [anydoc](https://github.com/firecrawl/anydoc), **with their tables preserved**.
 - 🧠 **Deep research** — iterative, multi-step research reports (a Python port of the [deep-research](https://github.com/dzhng/deep-research) algorithm), driven by the LLM of your choice.
+- 🤖 **MCP server** — the same capabilities exposed as [Model Context Protocol](https://modelcontextprotocol.io) tools, served from the same process at `/mcp`.
 
 Everything runs in-process — this is **not** a thin router over hosted services. Bring your own LLM key (OpenAI, Anthropic, Gemini, OpenRouter, …) via [litellm](https://github.com/BerriAI/litellm).
 
@@ -18,9 +20,11 @@ FastAPI  ──┬── /v1/search       → SearXNG
            ├── /v1/crawl/site    → crawl4ai deep crawl (async job)
            ├── /v1/extract       → crawl + CSS selectors or LLM → structured JSON
            ├── /v1/map           → sitemap.xml / robots.txt / page links → URL list
+           ├── /v1/convert       → upload a document (docx, xlsx, pdf, …) → Markdown
            ├── /v1/answer        → search + crawl + 1 LLM pass (fast, sourced)
            ├── /v1/research      → deep-research engine (sync or async job)
-           └── /v1/jobs/{id}     → job status + /stream (Server-Sent Events)
+           ├── /v1/jobs/{id}     → job status + /stream (Server-Sent Events)
+           └── /mcp              → the same capabilities as MCP tools (streamable HTTP)
 ```
 
 ## Quickstart (Docker)
@@ -92,6 +96,61 @@ uv run pytest -q --cov=app           # tests + the 80% coverage gate
 
 Interactive API docs are served at `/docs`.
 
+## MCP server
+
+The same capabilities are exposed to AI agents as [Model Context Protocol](https://modelcontextprotocol.io)
+tools, served at `MCP_PATH` (default `/mcp`) over the streamable-HTTP transport. Nine
+tools, grouped by what they cost — because that is the choice an agent actually has
+to make:
+
+| Cost | Tools |
+|---|---|
+| Free and instant | `web_search`, `map_site`, `deep_research_estimate`, `job_status` |
+| Browser time, no LLM | `fetch_url`, `crawl_site` |
+| LLM credits | `answer`, `extract_structured` |
+| Minutes and dollars | `deep_research` |
+
+It runs **in the API process**, not as a sidecar that would call the HTTP API back over
+the network. That is the whole point: one browser pool bounded by `CRAWL_MAX_CONCURRENCY`,
+one SearXNG cache, one cost ledger enforcing one daily cap, one job manager. A site crawl
+or a research run started by an agent *is* an HTTP job — same id, inspectable at
+`GET /v1/jobs/{id}`, streamable at `/stream`, cancellable with `DELETE /v1/jobs/{id}`.
+The two surfaces share one bill and one set of brakes rather than racing each other for
+the same browser.
+
+Clients authenticate with the same `API_KEYS`, sent as `Authorization: Bearer <key>` —
+the same labels, the same constant-time comparison, so an agent's spend lands in the same
+per-label counters as everything else. With `AUTH_ENABLED=false` the MCP surface is open,
+exactly like `/v1/*`.
+
+```jsonc
+// Point an MCP client at a running instance
+{
+  "mcpServers": {
+    "search-api": {
+      "type": "http",
+      "url": "https://your-host/mcp",
+      "headers": { "Authorization": "Bearer <your key>" }
+    }
+  }
+}
+```
+
+Two things shape what an agent gets back. Every tool result is capped at
+`MCP_MAX_RESULT_TOKENS` (default 4000) — a tool result is not read once and dropped, it
+sits in the transcript and is re-sent on every following turn — with the cut marked in
+place and the full payload left readable as a `search-api://artifact/{id}` resource. And
+`crawl_site` and `deep_research` return a job id immediately instead of blocking for
+minutes; the agent polls `job_status`.
+
+For desktop clients that speak only stdio, `python -m app.mcp` runs the same server over a
+pipe. Treat it as a **workstation** mode, not a server mode: that process starts its own
+browser pool, so `CRAWL_MAX_CONCURRENCY` bounds *that* process and not the fleet.
+
+The full tool catalogue, the resources (`search-api://artifact/…`, `search-api://job/…`,
+`search-api://capabilities`), the `research_brief` and `verify_claim` prompts and the
+per-client setup live in [`MCP_REFERENCE.md`](MCP_REFERENCE.md).
+
 ## Security & hardening
 
 - **API-key auth, on by default** — send `Authorization: Bearer <key>` or `X-API-Key`.
@@ -129,6 +188,39 @@ Interactive API docs are served at `/docs`.
   compose network.
 - In-flight jobs are cancelled cleanly on shutdown.
 
+## Document ingestion
+
+A URL that serves a document is downloaded and converted rather than handed to
+the browser, which would only download it again and render an empty page. The
+format is decided by the **bytes**, not the file extension or the `Content-Type`
+header — document portals mislabel downloads constantly, and plenty serve
+`/download?id=4021` with no extension at all.
+
+| | Formats |
+|---|---|
+| Word | `.doc`, `.docx`, `.docm` |
+| Spreadsheets | `.xlsx`, `.xlsm`, `.ods` |
+| Presentations | `.ppt`, `.pptx`, `.pptm`, `.ppsx` |
+| OpenDocument | `.odt`, `.ods`, `.odp` |
+| Other | `.pdf`, `.rtf`, `.epub`, `.csv` |
+
+Tables come back as Markdown tables, headings as headings, lists with their
+original numbering. This matters most where it is least visible: text extraction
+flattens a table into a column of values, so a model reading it has to *guess*
+which number belonged to which row — and it usually guesses right, which is worse
+than an obvious error.
+
+This applies wherever crawled content is used, so `/v1/extract`, `/v1/answer` and
+`/v1/research` all read documents with no change on their side. Each result
+carries a `source_format` field (`"html"`, `"pdf"`, `"xlsx"`, …) saying what it
+was read from. `POST /v1/convert` exposes the same conversion for a file you
+upload directly.
+
+**Known limitation: no OCR.** A scanned PDF — an image with no text layer — has
+nothing to extract and is reported as a failure, not silently returned empty.
+Fixing that would mean an OCR model inside the container, which this project
+deliberately does not do.
+
 ## Configuration
 
 All settings are environment variables — see [`.env.example`](.env.example).
@@ -149,6 +241,8 @@ All settings are environment variables — see [`.env.example`](.env.example).
 - [x] **Phase 11** — Persistence & bill protection: SQLite job store, labelled API keys, weighted rate limiting, token/cost accounting, cost circuit breakers, signed webhooks
 - [x] **Phase 12** — Observability: JSON logs with request-id correlation and an access line, Prometheus `/metrics` (auth-gated), optional OpenTelemetry tracing
 - [x] **Phase 13** — DX & industrialisation: mypy `--strict` and a coverage gate in CI, OpenAPI request examples, OpenAPI schema export + client generation, load tests and an in-process benchmark, Dependabot
+- [x] **Phase 14** — MCP server: nine cost-tiered tools mounted in the API process at `/mcp` (streamable HTTP + stdio), sharing the browser pool, cost ledger and jobs with `/v1/*`, per-tool rate-limit weights, capped tool results with the remainder served as artifact resources
+- [x] **Phase 15** — Document ingestion: twelve office formats read into Markdown with their tables intact, format detected from the bytes, `POST /v1/convert`
 
 ## License
 

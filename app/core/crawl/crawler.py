@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
 
+import anydoc
 import httpx
 from crawl4ai import (
     AsyncWebCrawler,
@@ -46,29 +47,113 @@ from app.models.crawl import CrawledPage, CrawlRequest, SiteCrawlRequest
 # Above this many tracked hosts, expired politeness entries are swept.
 _HOST_GATE_HIGH_WATER = 2048
 
-# PDF ingestion (§5.4). Redirects are followed by hand so the guard sees every hop.
-_PDF_MAX_REDIRECTS = 3
-_PDF_CHUNK = 64 * 1024
+# Document ingestion (§15.4). Redirects are followed by hand so the guard sees every hop.
+_DOCUMENT_MAX_REDIRECTS = 3
+_DOCUMENT_CHUNK = 64 * 1024
+
+# Extensions worth trying the document path on. Filtered through anydoc rather
+# than hard-coded: the installed version decides what it can actually read, so a
+# candidate this build does not support never gets routed away from the browser.
+_DOCUMENT_SUFFIXES: tuple[str, ...] = tuple(
+    sorted(
+        f".{extension}"
+        for extension in (
+            "csv",
+            "doc",
+            "docm",
+            "docx",
+            "epub",
+            "odp",
+            "ods",
+            "odt",
+            "pdf",
+            "pps",
+            "ppsx",
+            "ppt",
+            "pptm",
+            "pptx",
+            "rtf",
+            "xls",
+            "xlsb",
+            "xlsm",
+            "xlsx",
+        )
+        if anydoc.format_from_extension(extension) is not None
+    )
+)
+
+# Content types that name a format outright. A hint, not a verdict: §15.4.2 gives
+# the last word to the bytes, because portals mislabel downloads constantly.
+_CONTENT_TYPE_FORMATS: dict[str, anydoc.Format] = {
+    "application/pdf": "pdf",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-word.document.macroenabled.12": "docx",
+    "application/vnd.ms-excel": "xlsx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-excel.sheet.macroenabled.12": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.openxmlformats-officedocument.presentationml.slideshow": "pptx",
+    "application/vnd.ms-powerpoint.presentation.macroenabled.12": "pptx",
+    "application/vnd.oasis.opendocument.text": "odt",
+    "application/vnd.oasis.opendocument.spreadsheet": "ods",
+    "application/vnd.oasis.opendocument.presentation": "odp",
+    "application/rtf": "rtf",
+    "text/rtf": "rtf",
+    "application/epub+zip": "epub",
+    "text/csv": "csv",
+    "application/csv": "csv",
+}
+
+# Types that name nothing. Widely served by document portals, so they must not
+# disqualify a URL — they simply leave the decision entirely to the bytes.
+_GENERIC_CONTENT_TYPES = frozenset(
+    {
+        "application/octet-stream",
+        "application/x-download",
+        "application/download",
+        "application/force-download",
+        "binary/octet-stream",
+    }
+)
 
 
-class _NotAPdf(Exception):
-    """The candidate URL did not actually serve a PDF; fall back to the browser."""
+class _NotADocument(Exception):
+    """The candidate URL did not serve a document; fall back to the browser."""
 
 
-class _PdfTooLarge(Exception):
-    """The PDF exceeds CRAWL_PDF_MAX_MB. Reported as a clean per-page failure."""
+class _DocumentTooLarge(Exception):
+    """The document exceeds CRAWL_DOC_MAX_MB. Reported as a clean per-page failure."""
 
 
-def _looks_like_pdf_url(url: str) -> bool:
-    """Cheap, request-free pre-filter for the PDF path.
+def _looks_like_document_url(url: str) -> bool:
+    """Cheap, request-free pre-filter for the document path.
 
     Deliberately *not* a HEAD probe on every URL: that would add a round-trip to
-    every crawl to catch a minority of cases. The suffix covers plain ``.pdf``
-    links and the ``/pdf/`` segment covers arXiv-style extensionless URLs; a
-    candidate that turns out not to be a PDF simply falls back to the browser.
+    every crawl to catch a minority of cases. The suffixes cover plain
+    ``.pdf``/``.docx``/``.xlsx`` links and the ``/pdf/`` segment covers
+    arXiv-style extensionless URLs; a candidate that turns out not to be a
+    document simply falls back to the browser. Extensionless URLs the suffix
+    list cannot see (``/download?id=4021``) are caught after the fact by the
+    second chance in `_retry_as_document`.
     """
     path = urlsplit(url).path.lower()
-    return path.endswith(".pdf") or "/pdf/" in path
+    return path.endswith(_DOCUMENT_SUFFIXES) or "/pdf/" in path
+
+
+def _format_from_content_type(content_type: str) -> anydoc.Format | None:
+    return _CONTENT_TYPE_FORMATS.get(content_type)
+
+
+def _format_from_url(url: str) -> anydoc.Format | None:
+    """The format the URL's own extension names, if any.
+
+    Last resort behind the bytes and the content type, and the only thing that
+    can identify a CSV served as ``application/octet-stream``: plain-text formats
+    carry no signature, so `format_from_bytes` can never recognize them.
+    """
+    return anydoc.format_from_path(urlsplit(url).path)
 
 
 class CrawlerService:
@@ -79,14 +164,16 @@ class CrawlerService:
         *,
         guard: UrlGuard | None = None,
         per_host_delay: float = 1.0,
-        enable_pdf: bool = True,
-        pdf_max_mb: float = 25.0,
+        enable_documents: bool = True,
+        doc_max_mb: float = 25.0,
+        pdf_fallback: bool = True,
     ) -> None:
         self._max_concurrency = max(max_concurrency, 1)
         self._timeout = timeout
         self._timeout_ms = int(timeout * 1000)
-        self._pdf_enabled = enable_pdf
-        self._pdf_max_bytes = int(max(pdf_max_mb, 0.0) * 1024 * 1024)
+        self._documents_enabled = enable_documents
+        self._doc_max_bytes = int(max(doc_max_mb, 0.0) * 1024 * 1024)
+        self._pdf_fallback = pdf_fallback
         self._http: httpx.AsyncClient | None = None
         self._crawler = AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=False))
         self._started = False
@@ -224,10 +311,11 @@ class CrawlerService:
     async def _crawl_one(
         self, url: str, config: CrawlerRunConfig, req: CrawlRequest
     ) -> tuple[CrawledPage, str | None]:
-        if self._pdf_enabled and _looks_like_pdf_url(url):
-            pdf_page = await self._crawl_pdf(url, req)
-            if pdf_page is not None:  # None = not a PDF after all, use the browser
-                return pdf_page, None
+        tried_document = self._documents_enabled and _looks_like_document_url(url)
+        if tried_document:
+            document = await self._crawl_document(url, req)
+            if document is not None:  # None = not a document after all, use the browser
+                return document, None
 
         await self._await_host_slot(url)
         async with self._browser_session():
@@ -244,7 +332,29 @@ class CrawlerService:
             formats=req.formats,
         )
         extracted = getattr(result, "extracted_content", None)
-        return await self._guard_landing(url, page), extracted
+        page = await self._guard_landing(url, page)
+        if not tried_document:
+            page = await self._retry_as_document(url, page, req)
+        return page, extracted
+
+    async def _retry_as_document(
+        self, url: str, page: CrawledPage, req: CrawlRequest
+    ) -> CrawledPage:
+        """Second chance for a document URL the suffix filter could not see (§15.4.3).
+
+        A ``/download?id=4021`` that serves a .docx comes back from the browser as
+        a success with nothing in it — ``success: true``, ``markdown: ""``,
+        ``word_count: 0`` — which no caller can tell apart from a genuinely empty
+        page. Only that exact outcome triggers the retry, so the nominal path pays
+        nothing for it. A retry that also fails is not news: the browser's answer
+        is kept rather than replaced by a second, differently-worded failure.
+        """
+        if not self._documents_enabled or "markdown" not in set(req.formats):
+            return page
+        if not page.success or page.word_count:
+            return page
+        document = await self._crawl_document(url, req)
+        return document if document is not None and document.success else page
 
     async def crawl_site(
         self, req: SiteCrawlRequest, emit: Emit | None = None
@@ -385,6 +495,7 @@ class CrawlerService:
             url=getattr(result, "url", url),
             success=True,
             status_code=getattr(result, "status_code", None),
+            source_format="html",
             title=metadata.get("title") if isinstance(metadata, dict) else None,
             markdown=chosen,
             raw_markdown=raw_md if (include_raw and "markdown" in wanted) else None,
@@ -414,30 +525,38 @@ class CrawlerService:
 
         return page
 
-    # -- PDF ingestion (§5.4) ------------------------------------------------
+    # -- Document ingestion (§15.4) ------------------------------------------
 
-    async def _crawl_pdf(self, url: str, req: CrawlRequest) -> CrawledPage | None:
-        """Fetch and text-extract a PDF. ``None`` means "not a PDF, use the browser"."""
+    async def _crawl_document(self, url: str, req: CrawlRequest) -> CrawledPage | None:
+        """Fetch and convert a document. ``None`` means "not a document, use the browser"."""
         await self._await_host_slot(url)
-        async with self._sessions:  # a PDF download counts against the same budget
+        async with self._sessions:  # a document download counts against the same budget
             try:
-                data, status, landed = await self._fetch_pdf(url)
-            except _NotAPdf:
+                data, status, landed, fmt = await self._fetch_document(url)
+            except _NotADocument:
                 return None
-            except _PdfTooLarge as exc:
+            except _DocumentTooLarge as exc:
                 return CrawledPage(url=url, success=False, error=str(exc))
             except BlockedUrlError as exc:
                 return _blocked_page(url, str(exc))
             except Exception as exc:
-                return CrawledPage(url=url, success=False, error=f"pdf fetch failed: {exc}")
+                return CrawledPage(url=url, success=False, error=f"document fetch failed: {exc}")
 
         try:
-            # pypdf is CPU-bound and this process has a single event loop: parsing a
-            # 300-page PDF inline would freeze every other request.
-            title, markdown = await asyncio.to_thread(_pdf_to_markdown, data)
+            # Conversion is CPU-bound and this process has a single event loop:
+            # parsing a 300-page PDF inline would freeze every other request.
+            # anydoc releases the GIL while it works, so unlike pypdf this thread
+            # runs genuinely in parallel rather than taking turns.
+            title, markdown = await asyncio.to_thread(
+                document_to_markdown, data, fmt, pdf_fallback=self._pdf_fallback
+            )
         except Exception as exc:
             return CrawledPage(
-                url=landed, success=False, status_code=status, error=f"pdf parse failed: {exc}"
+                url=landed,
+                success=False,
+                status_code=status,
+                source_format=fmt,
+                error=f"document parse failed: {convert_error_reason(exc)}",
             )
 
         wanted = set(req.formats)
@@ -451,21 +570,30 @@ class CrawlerService:
             markdown=markdown,
             raw_markdown=markdown if (req.include_raw_markdown and "markdown" in wanted) else None,
             word_count=len(markdown.split()),
-            # A PDF has no HTML, no screenshot and no link map; those formats stay
-            # null rather than being faked.
-            pdf=_as_base64(data) if "pdf" in wanted else None,
+            source_format=fmt,
+            # A document has no HTML, no screenshot and no link map; those formats
+            # stay null rather than being faked. The raw bytes only come back under
+            # `pdf` when they actually are one — a .docx returned in a field named
+            # `pdf` would be a lie the client cannot detect.
+            pdf=_as_base64(data) if ("pdf" in wanted and fmt == "pdf") else None,
         )
 
-    async def _fetch_pdf(self, url: str) -> tuple[bytes, int | None, str]:
-        """GET ``url``, enforcing the size cap and re-guarding every redirect hop."""
-        client = self._pdf_client()
+    async def _fetch_document(self, url: str) -> tuple[bytes, int | None, str, anydoc.Format]:
+        """GET ``url``, enforcing the size cap and re-guarding every redirect hop.
+
+        Also decides *what* was fetched (§15.4.2). The content type is taken as a
+        hint and the bytes as the verdict, in that order of authority: a portal
+        serving a real .docx as ``application/octet-stream`` is read correctly,
+        and an HTML error page served as ``application/pdf`` is not.
+        """
+        client = self._document_client()
         current = url
-        for _ in range(_PDF_MAX_REDIRECTS + 1):
+        for _ in range(_DOCUMENT_MAX_REDIRECTS + 1):
             async with client.stream("GET", current) as resp:
                 if resp.is_redirect:
                     location = resp.headers.get("location")
                     if not location:
-                        raise _NotAPdf
+                        raise _NotADocument
                     current = str(resp.url.join(location))
                     # httpx does not follow redirects here on purpose: every hop
                     # goes back through the SSRF guard first.
@@ -473,28 +601,35 @@ class CrawlerService:
                     continue
 
                 content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-                if content_type and content_type != "application/pdf":
-                    raise _NotAPdf
+                hinted = _format_from_content_type(content_type)
+                if content_type and hinted is None and content_type not in _GENERIC_CONTENT_TYPES:
+                    # A type that names something else entirely (text/html,
+                    # image/png): no point downloading it to find that out.
+                    raise _NotADocument
                 declared = resp.headers.get("content-length")
-                if declared and declared.isdigit() and int(declared) > self._pdf_max_bytes:
-                    raise _PdfTooLarge(
-                        f"pdf is {int(declared) / 1e6:.1f} MB, over the "
-                        f"{self._pdf_max_bytes / 1e6:.0f} MB limit"
+                if declared and declared.isdigit() and int(declared) > self._doc_max_bytes:
+                    raise _DocumentTooLarge(
+                        f"document is {int(declared) / 1e6:.1f} MB, over the "
+                        f"{self._doc_max_bytes / 1e6:.0f} MB limit"
                     )
 
                 buffer = bytearray()
-                async for chunk in resp.aiter_bytes(_PDF_CHUNK):
+                async for chunk in resp.aiter_bytes(_DOCUMENT_CHUNK):
                     buffer.extend(chunk)
-                    if len(buffer) > self._pdf_max_bytes:
-                        raise _PdfTooLarge(
-                            f"pdf exceeds the {self._pdf_max_bytes / 1e6:.0f} MB limit"
+                    if len(buffer) > self._doc_max_bytes:
+                        raise _DocumentTooLarge(
+                            f"document exceeds the {self._doc_max_bytes / 1e6:.0f} MB limit"
                         )
-                if not content_type and not bytes(buffer[:5]).startswith(b"%PDF-"):
-                    raise _NotAPdf
-                return bytes(buffer), resp.status_code, str(resp.url)
-        raise _NotAPdf
+                data = bytes(buffer)
+                # The bytes have the last word; the header and the URL only break
+                # the tie for the signature-less formats (CSV).
+                fmt = anydoc.format_from_bytes(data) or hinted or _format_from_url(str(resp.url))
+                if fmt is None:
+                    raise _NotADocument
+                return data, resp.status_code, str(resp.url), fmt
+        raise _NotADocument
 
-    def _pdf_client(self) -> httpx.AsyncClient:
+    def _document_client(self) -> httpx.AsyncClient:
         if self._http is None:
             self._http = httpx.AsyncClient(
                 timeout=self._timeout,
@@ -517,8 +652,64 @@ def _as_base64(data: object) -> str | None:
     return None
 
 
+def convert_error_reason(exc: BaseException) -> str:
+    """A caller-readable one-liner for a failed conversion.
+
+    The exception *type* carries most of the information anydoc has — a
+    password-protected file and a truncated one are different problems with
+    different fixes — so it is named rather than flattened into the message.
+    """
+    return f"{type(exc).__name__}: {exc}"
+
+
+def document_to_markdown(
+    data: bytes, fmt: anydoc.Format, *, pdf_fallback: bool = True
+) -> tuple[str | None, str]:
+    """Convert ``data`` to Markdown, returning ``(title, markdown)``.
+
+    Blocking, and meant to be run on a worker thread (see the call sites):
+    anydoc releases the GIL for the duration of the conversion, so this is real
+    parallelism rather than two threads taking turns.
+    """
+    try:
+        markdown = anydoc.to_markdown_bytes(data, fmt)
+    except Exception:
+        # §15.8: the previous extraction path stays one environment variable away
+        # while anydoc is still 0.1.x. Catching `Exception` rather than
+        # `ConvertError` on purpose — if a young parser fails in a way we did not
+        # anticipate, degraded text still beats no page at all.
+        if fmt != "pdf" or not pdf_fallback:
+            raise
+        return _pdf_to_markdown(data)
+    return _title_from_markdown(markdown), markdown
+
+
+def _title_from_markdown(markdown: str) -> str | None:
+    """The document's first heading, or ``None`` when it opens without one.
+
+    anydoc returns rendered Markdown and nothing else — there is no title field
+    to read. The first heading is what a reader would call the title in every one
+    of the supported formats, and a document that starts with body text or a
+    table is left untitled rather than given an invented one.
+    """
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title[:300]
+        elif stripped:
+            break  # body text before any heading: nothing here is a title
+    return None
+
+
 def _pdf_to_markdown(data: bytes) -> tuple[str | None, str]:
-    """Extract a PDF's text as markdown, one ``## Page n`` section per page."""
+    """Extract a PDF's text as markdown, one ``## Page n`` section per page.
+
+    The pre-Phase-15 path, kept as the CRAWL_PDF_FALLBACK safety net (§15.8).
+    Tables come out of this as a bare column of values — which is the regression
+    anydoc exists to fix — so it is a fallback, never a first choice.
+    """
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(data))

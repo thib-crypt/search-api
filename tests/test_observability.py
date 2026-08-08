@@ -224,8 +224,10 @@ async def test_crawl_counter_and_session_gauge_move_with_a_crawl() -> None:
     from app.core.net.guard import UrlGuard
     from app.models.crawl import CrawlRequest
 
-    successes = _sample("crawl_pages_total", outcome="success")
-    failures = _sample("crawl_pages_total", outcome="failure")
+    # §15.4.5: the counter is split by what the page was read from, so a browser
+    # page and an ingested spreadsheet land in different series.
+    successes = _sample("crawl_pages_total", outcome="success", source_format="html")
+    failures = _sample("crawl_pages_total", outcome="failure", source_format="unknown")
     seen_active: list[float] = []
 
     class _StubBrowser:
@@ -252,8 +254,9 @@ async def test_crawl_counter_and_session_gauge_move_with_a_crawl() -> None:
 
     assert max(seen_active) >= 1  # a slot was held while the page was fetched
     assert _sample("crawler_browser_sessions_active") == 0  # and released after
-    assert _sample("crawl_pages_total", outcome="success") == successes + 1
-    assert _sample("crawl_pages_total", outcome="failure") == failures + 1
+    assert _sample("crawl_pages_total", outcome="success", source_format="html") == successes + 1
+    # A page that failed before anything was read has no source format.
+    assert _sample("crawl_pages_total", outcome="failure", source_format="unknown") == failures + 1
 
 
 def test_llm_usage_counters_take_the_delta_not_the_total() -> None:

@@ -16,6 +16,7 @@ import logging
 import time
 from collections import OrderedDict, deque
 from collections.abc import Iterable, MutableMapping
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -52,6 +53,9 @@ _WEIGHTS: tuple[tuple[str, int], ...] = tuple(
         (
             ("/v1/search", 1),
             ("/v1/map", 2),
+            # §15.5: no LLM call and no browser session — one CPU-bound
+            # conversion on a worker thread. Priced like /v1/map.
+            ("/v1/convert", 2),
             ("/v1/crawl", 5),
             ("/v1/answer", 10),
             ("/v1/extract", 10),
@@ -64,6 +68,9 @@ _WEIGHTS: tuple[tuple[str, int], ...] = tuple(
 )
 # Anything else that is not exempt (/v1/jobs/*, /, ...) costs this.
 _DEFAULT_WEIGHT = 1
+
+# Where `RateLimitMiddleware` leaves the window key it charged, for `charge()`.
+_BUCKET_STATE_KEY = "rate_limit_bucket"
 
 # Per-caller sliding window of (timestamp, weight) pairs, monotonic seconds.
 # An OrderedDict keyed in insertion order so the coldest client is evicted first
@@ -240,6 +247,58 @@ def path_weight(path: str) -> int:
     return _DEFAULT_WEIGHT
 
 
+@dataclass(frozen=True)
+class Charge:
+    """Outcome of a post-routing rate-limit debit (§6.2).
+
+    ``allowed`` is the only field a caller has to read; the rest exists so a
+    refusal can *say* what the budget was and when it frees up. An agent that is
+    told "100 points, 40 left, 27 seconds" can pace itself; one that gets an
+    opaque refusal retries immediately and burns the same wall.
+    """
+
+    allowed: bool
+    limit: int
+    remaining: int
+    reset_seconds: int
+    weight: int
+
+
+def charge(bucket_key: str, weight: int, *, label: str | None = None) -> Charge:
+    """Debit ``weight`` extra points from ``bucket_key``'s window, or refuse.
+
+    `RateLimitMiddleware` prices a request from its path, which it must: it runs
+    before routing. That is exactly wrong for `/mcp`, where every tool shares one
+    path and their real costs span two orders of magnitude — a `deep_research`
+    would be billed 1 point instead of 100 and the budget guard would stop
+    guarding anything. The MCP layer knows which tool was asked for, so it debits
+    the difference here, against the same deque and the same sliding window the
+    middleware uses. Nothing is charged when the debit would exceed the budget:
+    a refused call must not also cost points.
+    """
+    settings = get_settings()
+    limit = settings.rate_limit_overrides.get(label or "", settings.rate_limit_rpm)
+    if not settings.rate_limit_enabled or weight <= 0:
+        return Charge(True, limit, limit, 0, 0)
+
+    now = time.monotonic()
+    _purge(now, settings.rate_limit_max_clients)
+    hits = _HITS.get(bucket_key)
+    if hits is None:
+        hits = _HITS[bucket_key] = deque()
+    else:
+        _HITS.move_to_end(bucket_key)
+    while hits and now - hits[0][0] > _WINDOW:
+        hits.popleft()
+
+    spent = sum(w for _, w in hits)
+    reset = int(_WINDOW - (now - hits[0][0])) + 1 if hits else int(_WINDOW)
+    if spent + weight > limit:
+        return Charge(False, limit, max(limit - spent, 0), reset, weight)
+    hits.append((now, weight))
+    return Charge(True, limit, max(limit - (spent + weight), 0), reset, weight)
+
+
 def _client_ip(scope: Scope, trusted_proxy: bool) -> str:
     client = scope.get("client")
     if trusted_proxy:
@@ -247,6 +306,21 @@ def _client_ip(scope: Scope, trusted_proxy: bool) -> str:
         if forwarded_for:
             return forwarded_for.split(",")[0].strip()
     return client[0] if client else "unknown"
+
+
+def bucket_key(scope: Scope, settings: Settings) -> str:
+    """The rate-limit window key for a request, whatever stage it is at.
+
+    Public because `/mcp` needs the *same* key the middleware used: a second
+    debit against a different bucket would leave the first one untouched. The
+    middleware stashes what it computed on the ASGI state; this recomputes it
+    identically for the paths that never reached the limiter (exempt paths,
+    RATE_LIMIT_ENABLED=false, the stdio transport).
+    """
+    stashed = (scope.get("state") or {}).get(_BUCKET_STATE_KEY)
+    if isinstance(stashed, str):
+        return stashed
+    return _bucket(scope, settings)[0]
 
 
 def _bucket(scope: Scope, settings: Settings) -> tuple[str, str | None]:
@@ -293,6 +367,9 @@ class RateLimitMiddleware:
             return
 
         key, label = _bucket(scope, settings)
+        # Handed downstream so the MCP layer can top up the *same* window once it
+        # knows which tool was called (§6.2), instead of guessing the key again.
+        scope.setdefault("state", {})[_BUCKET_STATE_KEY] = key
         limit = settings.rate_limit_overrides.get(label or "", settings.rate_limit_rpm)
         weight = path_weight(scope["path"])
 

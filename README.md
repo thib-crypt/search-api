@@ -221,6 +221,28 @@ nothing to extract and is reported as a failure, not silently returned empty.
 Fixing that would mean an OCR model inside the container, which this project
 deliberately does not do.
 
+## Deployment
+
+[`docker-compose.coolify.yml`](docker-compose.coolify.yml) deploys the API and its SearXNG
+on a [Coolify](https://coolify.io) server as a Docker Compose build pack — no host port
+(the proxy routes the domain), no `.env` file (values come from the Coolify UI via `${VAR}`
+interpolation), and a named volume so SQLite can actually write as the container's non-root
+user. Step by step in [`DEPLOY_COOLIFY.md`](DEPLOY_COOLIFY.md).
+
+Before you start:
+
+- **A 4 GB / 2 vCPU server minimum**, 10 GB of disk. `CRAWL_MAX_CONCURRENCY=5` means up to
+  five Chromium instances at once, and the crawl4ai base image is ~2–3 GB.
+- **The first build takes 10–20 minutes** (base image + `playwright install chromium`).
+  Raise the build timeout if your platform cuts it short.
+- **Four required variables** — `API_KEYS`, `LLM_MODEL`, `SEARXNG_SECRET`, and the one
+  provider key matching the model prefix (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`). Generate secrets with `openssl rand -hex 32`.
+- **Give SearXNG no public domain.** It is unauthenticated and only the API talks to it.
+
+The same file works on any Docker Compose host with a reverse proxy in front; only the
+domain and environment-variable plumbing is Coolify-specific.
+
 ## Configuration
 
 All settings are environment variables — see [`.env.example`](.env.example).

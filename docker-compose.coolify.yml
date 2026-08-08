@@ -1,0 +1,94 @@
+# Compose file for a Coolify deployment. See DEPLOY_COOLIFY.md.
+#
+# Not interchangeable with docker-compose.yml, which targets a local machine:
+# that one publishes a host port, reads `env_file: .env`, and bind-mounts ./data.
+# All three are wrong here — the proxy owns routing, the .env is not in the repo,
+# and a bind mount is created root while the container runs as `appuser`.
+#
+# Every ${VAR} below becomes an editable field in the Coolify UI. `${VAR:?}` marks
+# a variable as required: the deploy fails with a named error instead of starting
+# with an empty value that only surfaces on the first LLM call.
+
+services:
+  api:
+    build: .
+    # No `ports:` — Coolify's proxy routes the domain to this service. Publishing a
+    # host port would bypass the proxy and lose the rolling update.
+    expose:
+      - "8000"
+    volumes:
+      # Named volume, not a bind mount: Docker copies /srv/api/data's ownership
+      # (appuser) from the image on first mount, so SQLite can write jobs.db.
+      # A bind mount would be created root on the host and left unwritable.
+      - api-data:/srv/api/data
+    environment:
+      # ---- App ----
+      ENVIRONMENT: production
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: json
+      # ---- Auth (the app refuses to start with AUTH_ENABLED=true and no key) ----
+      AUTH_ENABLED: "true"
+      API_KEYS: ${API_KEYS:?}
+      # ---- Hardening ----
+      RATE_LIMIT_ENABLED: "true"
+      RATE_LIMIT_RPM: ${RATE_LIMIT_RPM:-120}
+      RATE_LIMIT_RPM_OVERRIDES: ${RATE_LIMIT_RPM_OVERRIDES:-}
+      # Correct *because* of the proxy in front: it sets X-Forwarded-For, so the
+      # rate limiter sees the real client IP. Never enable on a published port.
+      TRUSTED_PROXY: "true"
+      SECURITY_HEADERS: "true"
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      # ---- SearXNG (internal compose network only) ----
+      SEARXNG_URL: http://searxng:8080
+      # ---- Jobs (persisted in the api-data volume) ----
+      JOB_BACKEND: sqlite
+      JOB_DB_PATH: /srv/api/data/jobs.db
+      # ---- LLM ----
+      # litellm routes on the prefix: "openrouter/<vendor>/<model>",
+      # "openai/gpt-4o-mini", "anthropic/claude-...". Set the key that matches.
+      LLM_MODEL: ${LLM_MODEL:?}
+      LLM_REPORT_MODEL: ${LLM_REPORT_MODEL:-}
+      LLM_FALLBACK_MODELS: ${LLM_FALLBACK_MODELS:-}
+      RESEARCH_RERANK_MODEL: ${RESEARCH_RERANK_MODEL:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # Sent by litellm as HTTP-Referer / X-Title for OpenRouter attribution.
+      OR_SITE_URL: ${OR_SITE_URL:-}
+      OR_APP_NAME: ${OR_APP_NAME:-}
+      # ---- Cost brakes ----
+      RESEARCH_MAX_COST_USD: ${RESEARCH_MAX_COST_USD:-0}
+      DAILY_COST_CAP_USD: ${DAILY_COST_CAP_USD:-0}
+      # ---- Webhooks (required only if clients pass webhook_url) ----
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      # ---- Crawl / SSRF ----
+      CRAWL_MAX_CONCURRENCY: ${CRAWL_MAX_CONCURRENCY:-5}
+      CRAWL_ALLOW_PRIVATE_NETWORKS: "false"
+    depends_on:
+      searxng:
+        # Without this the first searches fail while SearXNG is still booting.
+        condition: service_healthy
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    # Deliberately not published and given no domain in the UI: an unauthenticated
+    # search backend on the internet is also an SSRF target.
+    expose:
+      - "8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?}
+    healthcheck:
+      test: ["CMD", "wget", "-qO", "/dev/null", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  api-data:

@@ -226,8 +226,9 @@ deliberately does not do.
 [`docker-compose.coolify.yml`](docker-compose.coolify.yml) deploys the API and its SearXNG
 on a [Coolify](https://coolify.io) server as a Docker Compose build pack — no host port
 (the proxy routes the domain), no `.env` file (values come from the Coolify UI via `${VAR}`
-interpolation), and a named volume so SQLite can actually write as the container's non-root
-user. Step by step in [`DEPLOY_COOLIFY.md`](DEPLOY_COOLIFY.md).
+interpolation), a named volume so SQLite can actually write as the container's non-root
+user, and SearXNG's `settings.yml` baked into a small image rather than bind-mounted.
+Step by step in [`DEPLOY_COOLIFY.md`](DEPLOY_COOLIFY.md).
 
 Before you start:
 

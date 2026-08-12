@@ -3,8 +3,12 @@
 use_default_settings: true
 
 server:
-  # Provided via the SEARXNG_SECRET environment variable in docker-compose.
-  secret_key: "change-me-please"
+  # Overridden at startup by the SEARXNG_SECRET environment variable, which both
+  # compose files set. "ultrasecretkey" is SearXNG's own placeholder, the string
+  # its tooling looks for — so the fallback is a known placeholder rather than a
+  # value nothing recognises, and this file is now baked into the image built by
+  # `searxng/Dockerfile`.
+  secret_key: "ultrasecretkey"
   limiter: false # internal-only instance; the API is the sole client
   image_proxy: false
 

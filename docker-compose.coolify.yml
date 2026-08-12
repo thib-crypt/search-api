@@ -72,13 +72,17 @@ services:
     restart: unless-stopped
 
   searxng:
-    image: searxng/searxng:latest
+    # Built, not pulled: `searxng/Dockerfile` copies settings.yml into the image.
+    # A `./searxng:/etc/searxng` bind mount does not survive Coolify — it becomes
+    # a managed storage pointing at an empty directory it creates itself, so the
+    # repository's settings.yml never lands in the container and SearXNG starts
+    # without the `json` output format, answering 403 to every API query.
+    build:
+      context: ./searxng
     # Deliberately not published and given no domain in the UI: an unauthenticated
     # search backend on the internet is also an SSRF target.
     expose:
       - "8080"
-    volumes:
-      - ./searxng:/etc/searxng:rw
     environment:
       SEARXNG_BASE_URL: http://searxng:8080/
       SEARXNG_SECRET: ${SEARXNG_SECRET:?}

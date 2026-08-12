@@ -39,11 +39,14 @@ and `uv` by digest, so an uncached rebuild starts from zero every time.
 the `api` service only, and include the port, since the container does not listen on 80:
 
 ```
-http://search.example.com:8000
+https://search.example.com:8000
 ```
 
-Coolify strips the port when generating the proxy rule and issues the TLS certificate, so
-the service ends up served over HTTPS at `https://search.example.com`.
+**The scheme decides the TLS.** Coolify only requests a Let's Encrypt certificate for a
+domain declared `https://`. Write `http://` and the service is served in cleartext on port
+80 while 443 answers `503` behind Traefik's default self-signed certificate. The port is
+the *container's* port: Coolify strips it from the proxy rule, so the service ends up
+served at `https://search.example.com`.
 
 Leave `searxng` **without a domain**. It is an unauthenticated search backend; exposing it
 publicly hands an SSRF payload a ready-made target. Do not fill in *Ports Mappings* for
@@ -161,8 +164,12 @@ curl -s https://search.example.com/health
 ```
 
 ```bash
-curl -s -H "Authorization: Bearer <your-key>" https://search.example.com/health/ready | jq
+curl -s https://search.example.com/health/ready | jq
 ```
+
+Both probes are public — the health router carries no `require_api_key`, unlike `/metrics`
+and every `/v1/*` route. Handy for an uptime monitor; worth knowing that the readiness body
+names your provider.
 
 Expected: `"status": "ready"` with three checks — `searxng: reachable`,
 `crawler: browser pool not started yet (lazy)` (normal before the first crawl) and
@@ -196,6 +203,7 @@ deployment-specific choices breaks on Coolify:
 | `ports: "${API_PORT}:8000"` | Bypasses the proxy, and loses rolling updates | `expose: 8000`, proxy owns the routing |
 | `env_file: .env` | `.env` is gitignored and absent from the cloned repo | `${VAR}` interpolation, values from the UI |
 | `volumes: ./data:/srv/api/data` | Bind mount is created **root** on the host; the container runs as `appuser`, so SQLite cannot write `jobs.db` | named volume `api-data`, which inherits the image's ownership |
+| `volumes: ./searxng:/etc/searxng` | Coolify turns the bind mount into a managed storage pointing at an **empty** directory it creates; `settings.yml` never reaches the container, SearXNG boots without the `json` format and answers **403** to every query (the API surfaces it as a 502) | `searxng/Dockerfile` copies `settings.yml` into the image — no bind mount at all |
 
 ---
 
@@ -208,10 +216,15 @@ deployment-specific choices breaks on Coolify:
 - **`CRAWL_ALLOW_PRIVATE_NETWORKS` stays `false`.** Set to `true`, any client can make the
   server read `169.254.169.254`, the SearXNG container, or anything else on your Coolify
   host's internal network.
-- **`SEARXNG_SECRET`.** [`searxng/settings.yml`](searxng/settings.yml) carries a
-  placeholder `secret_key`; the image also reads the environment variable. The instance is
-  not exposed (no domain, no published port) so the impact is low, but set the variable
-  anyway — and replace the value in `settings.yml` if you want certainty.
+- **`SEARXNG_SECRET`.** [`searxng/settings.yml`](searxng/settings.yml) carries SearXNG's
+  own `ultrasecretkey` placeholder, overridden at startup by the environment variable. The
+  instance is not exposed (no domain, no published port) so the impact is low, but set the
+  variable anyway.
+- **Never bind-mount a config directory here.** `settings.yml` is baked into the SearXNG
+  image on purpose (see [Why two compose files](#why-two-compose-files)). Reintroduce
+  `volumes: ./searxng:/etc/searxng` and Coolify silently mounts an empty directory over it,
+  which reads as "SearXNG returned 403" at the first search — hours from the edit that
+  caused it.
 - **`/metrics` is authenticated** (it publishes spend per label) and exempt from rate
   limiting. Give an external Prometheus its own label in `API_KEYS`, e.g.
   `prometheus:<key>`.

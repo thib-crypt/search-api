@@ -24,7 +24,7 @@ dependencies = [
     # Phase 15 §8: pinned to an exact version, not a range. The project is young
     # (0.1.x, published August 2026) and parses untrusted bytes from the internet;
     # a patch release must land through a reviewed bump, not through a rebuild.
-    "firecrawl-anydoc==0.1.7",
+    "firecrawl-anydoc==0.2.4",
     # Kept alongside anydoc as the PDF fallback (CRAWL_PDF_FALLBACK, §8): the
     # previous extraction path stays reachable by one environment variable.
     "pypdf>=6.15.0",

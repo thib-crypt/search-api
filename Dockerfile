@@ -7,7 +7,7 @@
 # and the installed package cannot drift apart. To move: bump uv.lock first, then
 # read the matching digest from
 # `docker buildx imagetools inspect unclecode/crawl4ai:<tag>`.
-FROM unclecode/crawl4ai@sha256:b243f684ad20f71ee108ab3fc3f31f3349eb5b31a9947b9e563d868417141aad
+FROM unclecode/crawl4ai@sha256:0b05666882bfb67f45d559a5b827839c54127b74aedd723f8ab338a3571b5fc9
 
 # The base image runs as the unprivileged `appuser`. Root is needed only to
 # install system-wide; the final USER below drops back. The COPY --chmod flags
